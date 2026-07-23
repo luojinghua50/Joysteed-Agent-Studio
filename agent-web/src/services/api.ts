@@ -78,6 +78,22 @@ export async function getChatHistory(
   return data.messages || [];
 }
 
+export interface SessionSummary {
+  session_id: string;
+  created_at?: string;
+  updated_at?: string;
+  message_count: number;
+  preview?: string | null;
+}
+
+/** List the current customer's sessions, newest first. Identity is token-derived. */
+export async function listSessions(): Promise<SessionSummary[]> {
+  const response = await authFetch(`${API_BASE}/sessions`);
+  if (!response.ok) return [];
+  const data = await response.json();
+  return data.sessions || [];
+}
+
 export async function createSession(customerId: string): Promise<string> {
   const response = await authFetch(`${API_BASE}/sessions`, {
     method: 'POST',

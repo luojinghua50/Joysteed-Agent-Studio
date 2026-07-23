@@ -1,29 +1,51 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { ChatWindow } from '@/components/ChatWindow';
 import { LoginForm } from '@/components/LoginForm';
 import { useChat } from '@/hooks/useChat';
-import { createSession } from '@/services/api';
+import { createSession, listSessions, SessionSummary } from '@/services/api';
 import { getCustomerId, isLoggedIn, logout, guestLogin } from '@/services/auth';
 
 function App() {
   const [sessionId, setSessionId] = useState<string>('');
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
   // null = not yet decided; once set, we have a customer_id (guest or user).
   const [customerId, setCustomerId] = useState<string | null>(
     () => (isLoggedIn() ? getCustomerId() : null),
   );
 
+  const refreshSessions = useCallback(async (): Promise<SessionSummary[]> => {
+    const list = await listSessions();
+    setSessions(list);
+    return list;
+  }, []);
+
+  // On login/guest, restore the conversation from the server rather than from
+  // localStorage alone: pick the last-used session if it's still ours, else the
+  // most recent one, else create a fresh session. This is what lets history
+  // survive a logout/login (the session_id in localStorage is not enough).
   useEffect(() => {
     if (!customerId) return;
-    const stored = localStorage.getItem('agent_session_id');
-    if (stored) {
-      setSessionId(stored);
-    } else {
-      createSession(customerId).then((id) => {
-        localStorage.setItem('agent_session_id', id);
-        setSessionId(id);
-      });
-    }
-  }, [customerId]);
+    let cancelled = false;
+    (async () => {
+      const list = await refreshSessions();
+      if (cancelled) return;
+      const stored = localStorage.getItem('agent_session_id');
+      const storedIsMine = stored && list.some((s) => s.session_id === stored);
+      let id: string;
+      if (storedIsMine) {
+        id = stored!;
+      } else if (list.length > 0) {
+        id = list[0].session_id; // newest first, from the backend ordering
+      } else {
+        id = await createSession(customerId);
+        if (cancelled) return;
+        await refreshSessions();
+      }
+      localStorage.setItem('agent_session_id', id);
+      setSessionId(id);
+    })();
+    return () => { cancelled = true; };
+  }, [customerId, refreshSessions]);
 
   const { messages, isLoading, currentAgent, send, stop, reset } = useChat(
     sessionId,
@@ -37,12 +59,21 @@ function App() {
     const id = await createSession(customerId);
     localStorage.setItem('agent_session_id', id);
     setSessionId(id);
+    await refreshSessions();
+  };
+
+  const handleSelectSession = (id: string) => {
+    if (id === sessionId) return;
+    reset();
+    localStorage.setItem('agent_session_id', id);
+    setSessionId(id);
   };
 
   const handleLogout = () => {
     logout();
     localStorage.removeItem('agent_session_id');
     reset();
+    setSessions([]);
     setSessionId('');
     setCustomerId(null);
   };
@@ -69,6 +100,9 @@ function App() {
           messages={messages}
           isLoading={isLoading}
           currentAgent={currentAgent}
+          sessions={sessions}
+          activeSessionId={sessionId}
+          onSelectSession={handleSelectSession}
           onSend={send}
           onStop={stop}
           onNewChat={handleNewChat}

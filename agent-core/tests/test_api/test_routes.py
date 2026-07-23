@@ -202,3 +202,48 @@ async def test_chat_blocks_cross_customer_message(client, auth):
         "content": "intruder",
     }, headers=auth("C999"))
     assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_returns_only_own_sessions(client, auth):
+    # C001 posts into two sessions; C999 into one. Each customer sees only
+    # their own, so history survives logout/login without leaking across users.
+    await client.post("/v1/chat/list-a", json={"content": "查询订单"}, headers=auth("C001"))
+    await client.post("/v1/chat/list-b", json={"content": "退换货"}, headers=auth("C001"))
+    await client.post("/v1/chat/list-c", json={"content": "别人的会话"}, headers=auth("C999"))
+
+    response = await client.get("/v1/sessions", headers=auth("C001"))
+    assert response.status_code == 200
+    sessions = response.json()["sessions"]
+    ids = {s["session_id"] for s in sessions}
+    assert ids == {"list-a", "list-b"}
+    # Preview carries the first user message; message_count is populated.
+    previews = {s["session_id"]: s["preview"] for s in sessions}
+    assert previews["list-a"] == "查询订单"
+    assert all(s["message_count"] >= 1 for s in sessions)
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_requires_token(client):
+    assert (await client.get("/v1/sessions")).status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_empty_for_new_customer(client, auth):
+    response = await client.get("/v1/sessions", headers=auth("C-fresh"))
+    assert response.status_code == 200
+    assert response.json()["sessions"] == []
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_omits_empty_sessions(client, auth):
+    # A bare session with no messages (as created on every login) must not
+    # appear in the list, so auto-resume never lands on a blank conversation.
+    await client.post("/v1/sessions", json={"content": "init"}, headers=auth("C500"))
+    await client.post("/v1/chat/has-msgs", json={"content": "查询订单"}, headers=auth("C500"))
+
+    response = await client.get("/v1/sessions", headers=auth("C500"))
+    assert response.status_code == 200
+    sessions = response.json()["sessions"]
+    ids = {s["session_id"] for s in sessions}
+    assert ids == {"has-msgs"}

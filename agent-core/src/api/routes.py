@@ -10,9 +10,12 @@ from fastapi.responses import StreamingResponse, Response
 from langchain_core.messages import HumanMessage, AIMessage
 from langgraph.types import Command
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
-from sqlalchemy import select
+from sqlalchemy import select, func
 
-from src.api.schemas import ChatRequest, ApprovalRequest, SessionCreateRequest, HealthResponse, ChatHistoryResponse
+from src.api.schemas import (
+    ChatRequest, ApprovalRequest, SessionCreateRequest, HealthResponse,
+    ChatHistoryResponse, SessionListResponse,
+)
 from src.api.deps import current_customer
 from src.agents.graph import compile_graph
 from src.config import Settings
@@ -339,6 +342,58 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 for m in messages
             ],
         )
+
+    @app.get("/v1/sessions", response_model=SessionListResponse)
+    async def list_sessions(customer_id: str = Depends(current_customer)):
+        """List the calling customer's sessions, newest first.
+
+        Identity is token-derived, so a customer only ever sees their own
+        conversations. Each summary carries a preview (first user message) and a
+        message count so the frontend can render a history list without fetching
+        every session's full transcript.
+
+        Empty sessions (0 messages) are omitted: a fresh session is created up
+        front on every login, so listing them would clutter the history and make
+        auto-resume land on a blank conversation.
+        """
+        db_factory = app.state.db_session_factory
+        async with db_factory() as db:
+            stmt = (
+                select(SessionModel)
+                .where(SessionModel.customer_id == customer_id)
+                .order_by(SessionModel.updated_at.desc())
+            )
+            result = await db.execute(stmt)
+            sessions = result.scalars().all()
+
+            summaries = []
+            for s in sessions:
+                count_stmt = select(func.count()).select_from(MessageModel).where(
+                    MessageModel.session_id == s.id
+                )
+                message_count = (await db.execute(count_stmt)).scalar_one()
+                if message_count == 0:
+                    continue
+
+                preview_stmt = (
+                    select(MessageModel.content)
+                    .where(MessageModel.session_id == s.id, MessageModel.role == "user")
+                    .order_by(MessageModel.timestamp)
+                    .limit(1)
+                )
+                preview = (await db.execute(preview_stmt)).scalars().first()
+                if preview and len(preview) > 60:
+                    preview = preview[:60] + "…"
+
+                summaries.append({
+                    "session_id": s.id,
+                    "created_at": s.created_at,
+                    "updated_at": s.updated_at,
+                    "message_count": message_count,
+                    "preview": preview,
+                })
+
+        return SessionListResponse(sessions=summaries)
 
     @app.post("/v1/sessions")
     async def create_session(request: SessionCreateRequest,

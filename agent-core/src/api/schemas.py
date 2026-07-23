@@ -43,6 +43,24 @@ class ChatHistoryResponse(BaseModel):
     messages: list[ChatMessage]
 
 
+class SessionSummary(BaseModel):
+    """One session in a customer's session list.
+
+    ``preview`` is the first user message (trimmed) so the frontend can label
+    each conversation without loading its full history.
+    """
+    session_id: str
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    message_count: int = 0
+    preview: str | None = None
+
+
+class SessionListResponse(BaseModel):
+    """Response model for a customer's session list, newest first."""
+    sessions: list[SessionSummary]
+
+
 class HealthResponse(BaseModel):
     """Health check response."""
     status: str = "ok"

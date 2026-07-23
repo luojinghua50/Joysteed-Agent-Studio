@@ -1,14 +1,26 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { ChatMessage } from '@/services/api';
+import { ChatMessage, SessionSummary } from '@/services/api';
 
 interface ChatWindowProps {
   messages: ChatMessage[];
   isLoading: boolean;
   currentAgent: string;
+  sessions: SessionSummary[];
+  activeSessionId: string;
+  onSelectSession: (sessionId: string) => void;
   onSend: (content: string) => void;
   onStop: () => void;
   onNewChat: () => void;
   onLogout?: () => void;
+}
+
+function formatSessionTime(iso?: string): string {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  return d.toLocaleString('zh-CN', {
+    month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit',
+  });
 }
 
 const quickActions = [
@@ -52,8 +64,9 @@ function BotAvatar({ size = 24 }: { size?: number }) {
   );
 }
 
-export function ChatWindow({ messages, isLoading, currentAgent, onSend, onStop, onNewChat, onLogout }: ChatWindowProps) {
+export function ChatWindow({ messages, isLoading, currentAgent, sessions, activeSessionId, onSelectSession, onSend, onStop, onNewChat, onLogout }: ChatWindowProps) {
   const [input, setInput] = useState('');
+  const [showHistory, setShowHistory] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -82,6 +95,14 @@ export function ChatWindow({ messages, isLoading, currentAgent, onSend, onStop, 
           <button
             type="button"
             style={styles.newChatBtn}
+            onClick={() => setShowHistory((v) => !v)}
+            title="查看历史会话"
+          >
+            🕘 历史{sessions.length > 0 ? ` (${sessions.length})` : ''}
+          </button>
+          <button
+            type="button"
+            style={styles.newChatBtn}
             onClick={onNewChat}
             title="开启一段全新对话"
           >
@@ -99,6 +120,41 @@ export function ChatWindow({ messages, isLoading, currentAgent, onSend, onStop, 
           )}
         </div>
       </div>
+
+      {/* History panel — lists this customer's past sessions so a conversation
+          can be resumed after logout/login (not just this browser's last one). */}
+      {showHistory && (
+        <div style={styles.historyPanel}>
+          {sessions.length === 0 ? (
+            <div style={styles.historyEmpty}>暂无历史会话</div>
+          ) : (
+            sessions.map((s) => {
+              const isActive = s.session_id === activeSessionId;
+              return (
+                <button
+                  key={s.session_id}
+                  type="button"
+                  style={{
+                    ...styles.historyItem,
+                    ...(isActive ? styles.historyItemActive : {}),
+                  }}
+                  onClick={() => {
+                    onSelectSession(s.session_id);
+                    setShowHistory(false);
+                  }}
+                >
+                  <div style={styles.historyPreview}>
+                    {s.preview || '（空对话）'}
+                  </div>
+                  <div style={styles.historyMeta}>
+                    {formatSessionTime(s.updated_at)} · {s.message_count} 条
+                  </div>
+                </button>
+              );
+            })
+          )}
+        </div>
+      )}
 
       {/* Messages Area */}
       <div style={styles.messagesArea}>
@@ -302,6 +358,47 @@ const styles: Record<string, React.CSSProperties> = {
     overflowX: 'auto' as const,
     borderTop: '1px solid #eee',
     background: '#fafbfe',
+  },
+  historyPanel: {
+    maxHeight: '40%',
+    overflowY: 'auto' as const,
+    borderBottom: '1px solid #eee',
+    background: '#fafbfe',
+    padding: '8px',
+  },
+  historyEmpty: {
+    padding: '20px',
+    textAlign: 'center' as const,
+    color: '#999',
+    fontSize: '13px',
+  },
+  historyItem: {
+    display: 'block',
+    width: '100%',
+    textAlign: 'left' as const,
+    padding: '10px 12px',
+    marginBottom: '6px',
+    background: '#fff',
+    border: '1px solid #e8e8e8',
+    borderRadius: '10px',
+    cursor: 'pointer',
+    transition: 'all 0.2s',
+  },
+  historyItemActive: {
+    borderColor: '#4facfe',
+    background: '#e8f4ff',
+  },
+  historyPreview: {
+    fontSize: '14px',
+    color: '#333',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap' as const,
+  },
+  historyMeta: {
+    fontSize: '12px',
+    color: '#999',
+    marginTop: '4px',
   },
   quickChip: {
     padding: '6px 12px',
