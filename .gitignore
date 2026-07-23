@@ -1,0 +1,63 @@
+# ===== Secrets / 环境变量（最重要：防 API key 泄露）=====
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# ===== 运行时数据 / docker volume（防对话历史、向量数据误提交）=====
+pg_data/
+redis_data/
+minio_data/
+prometheus_data/
+grafana_data/
+tempo_data/
+clickhouse_data/
+*.db
+*.sqlite
+*.sqlite3
+data/
+volumes/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+env/
+.Python
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ===== Node / 前端 =====
+node_modules/
+agent-web/dist/
+agent-web/build/
+*.local
+.vite/
+
+# ===== 日志 / 临时文件 =====
+*.log
+logs/
+tmp/
+.cache/
+
+# ===== 私有文档（留个人查看修改，不开源）=====
+docs/private/
+
+# ===== 编辑器 / 系统 =====
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

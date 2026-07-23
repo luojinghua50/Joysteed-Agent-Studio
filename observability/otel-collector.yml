@@ -1,0 +1,40 @@
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: "0.0.0.0:4318"
+      grpc:
+        endpoint: "0.0.0.0:4317"
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+
+exporters:
+  otlp/tempo:
+    endpoint: "tempo:4317"
+    tls:
+      insecure: true
+
+  # 同时把 trace 转发给 Langfuse 的 OTel 摄取端点（保留原有 LLM 可观测能力）。
+  # Basic 头 = base64("pk-lf-agent-studio:sk-lf-agent-studio")，与 agent-core 原配置一致。
+  otlphttp/langfuse:
+    endpoint: "http://langfuse:3000/api/public/otel"
+    headers:
+      Authorization: "Basic cGstbGYtYWdlbnQtc3R1ZGlvOnNrLWxmLWFnZW50LXN0dWRpbw=="
+
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+    namespace: agent_studio
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/tempo, otlphttp/langfuse]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheus]

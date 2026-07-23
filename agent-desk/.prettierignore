@@ -1,0 +1,11 @@
+# Build output
+dist
+node_modules
+
+# Generated / lockfiles
+package-lock.json
+*.min.js
+
+# Misc
+coverage
+public

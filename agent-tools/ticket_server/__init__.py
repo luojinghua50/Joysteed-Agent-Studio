@@ -1,0 +1,1 @@
+"""Ticket MCP Server package."""

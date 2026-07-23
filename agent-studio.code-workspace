@@ -1,0 +1,70 @@
+{
+  "folders": [
+    { "name": "🟢 agent-core", "path": "agent-core" },
+    { "name": "🟣 agent-rag", "path": "agent-rag" },
+    { "name": "🔧 agent-tools", "path": "agent-tools" },
+    { "name": "🌐 agent-web", "path": "agent-web" },
+    { "name": "📦 root (infra)", "path": "." }
+  ],
+  "settings": {
+    "files.exclude": {
+      "**/.venv": false,
+      "**/__pycache__": true,
+      "**/.pytest_cache": true,
+      "**/.ruff_cache": true,
+      "**/*.egg-info": true
+    },
+    "search.exclude": {
+      "**/.venv": true,
+      "**/node_modules": true,
+      "**/dist": true,
+      "**/uv.lock": true,
+      "**/package-lock.json": true
+    },
+    "editor.formatOnSave": true,
+    "editor.rulers": [100],
+
+    "[python]": {
+      "editor.defaultFormatter": "charliermarsh.ruff",
+      "editor.formatOnSave": true,
+      "editor.codeActionsOnSave": {
+        "source.fixAll.ruff": "explicit",
+        "source.organizeImports.ruff": "explicit"
+      }
+    },
+    "[typescript]": { "editor.defaultFormatter": "esbenp.prettier-vscode" },
+    "[typescriptreact]": { "editor.defaultFormatter": "esbenp.prettier-vscode" },
+    "[json]": { "editor.defaultFormatter": "esbenp.prettier-vscode" },
+    "[jsonc]": { "editor.defaultFormatter": "esbenp.prettier-vscode" },
+    "[yaml]": { "editor.defaultFormatter": "redhat.vscode-yaml" },
+
+    "ruff.enable": true,
+    "python.testing.pytestEnabled": true,
+    "python.testing.unittestEnabled": false,
+    "python.analysis.typeCheckingMode": "basic",
+    "python.analysis.autoImportCompletions": true,
+
+    "eslint.workingDirectories": [{ "mode": "auto" }],
+    "typescript.tsdk": "agent-web/node_modules/typescript/lib",
+
+    "yaml.schemas": {
+      "https://raw.githubusercontent.com/compose-spec/compose-spec/master/schema/compose-spec.json": "docker-compose*.yml"
+    }
+  },
+  "extensions": {
+    "recommendations": [
+      "ms-python.python",
+      "ms-python.vscode-pylance",
+      "ms-python.debugpy",
+      "charliermarsh.ruff",
+      "dbaeumer.vscode-eslint",
+      "esbenp.prettier-vscode",
+      "vitest.explorer",
+      "ms-azuretools.vscode-docker",
+      "ms-vscode-remote.remote-containers",
+      "redhat.vscode-yaml",
+      "tamasfe.even-better-toml",
+      "mikestead.dotenv"
+    ]
+  }
+}

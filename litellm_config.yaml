@@ -1,0 +1,40 @@
+model_list:
+  - model_name: "claude-haiku-4-5"
+    litellm_params:
+      # anthropic provider → 走上游原生 /v1/messages，litellm 自动把 system 消息
+      # 提到顶层 system 参数。openai provider 走 /v1/chat/completions，上游中转
+      # 不翻译 system，会报 "messages.0: use the top-level 'system' parameter"。
+      model: anthropic/claude-haiku-4-5-20251001
+      api_key: os.environ/ANTHROPIC_API_KEY
+      api_base: os.environ/LLM_API_BASE   # 从 .env 注入；官方直连填 https://api.anthropic.com，中转填中转地址
+    model_info:
+      description: "FAQ、简单查询 — 快且便宜"
+
+  - model_name: "claude-sonnet-4-6"
+    litellm_params:
+      model: anthropic/claude-sonnet-4-6
+      api_key: os.environ/ANTHROPIC_API_KEY
+      api_base: os.environ/LLM_API_BASE   # 从 .env 注入；官方直连填 https://api.anthropic.com，中转填中转地址
+    model_info:
+      description: "订单、技术支持 — 主力模型"
+
+  - model_name: "claude-opus-4-6"
+    litellm_params:
+      model: anthropic/claude-opus-4-6
+      api_key: os.environ/ANTHROPIC_API_KEY
+      api_base: os.environ/LLM_API_BASE   # 从 .env 注入；官方直连填 https://api.anthropic.com，中转填中转地址
+    model_info:
+      description: "复杂投诉、情绪安抚 — 最强理解力"
+
+litellm_settings:
+  set_verbose: true
+  log_responses: true
+  json_logs: true
+
+router_settings:
+  routing_strategy: "simple-shuffle"
+  num_retries: 2
+  timeout: 60
+  fallbacks:
+    - "claude-sonnet-4-6": ["claude-haiku-4-5"]
+    - "claude-opus-4-6": ["claude-sonnet-4-6"]

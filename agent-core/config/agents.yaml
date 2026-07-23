@@ -1,0 +1,47 @@
+# Agent 注册配置（agents-as-data）
+#
+# 新增业务 Agent = 在此加一段，无需改任何 .py。
+#
+# tools 字段支持两种授权粒度（按最小权限原则）：
+#   - "server:order"        → 授权该 MCP server 上的【全部】工具（含未来新增，零改动）
+#   - "tool:apply_refund"   → 只授权这一个具体工具（细粒度，敏感操作用）
+# 同一个 agent 可混用两种写法。
+#
+# can_handoff_to 是业务编排策略（谁能转给谁），人为定义，不自动发现。
+
+agents:
+  faq:
+    prompt_id: agents/faq_system
+    model_key: model_fast
+    history_window: 5
+    tools:
+      - server:knowledge          # knowledge server 全部工具（search_faq/search_docs/未来新增）
+    can_handoff_to: [order, complaint, tech_support]
+    reflection: "off"
+
+  order:
+    prompt_id: agents/order_system
+    model_key: model_main
+    tools:
+      - server:order              # order server 全部工具
+    can_handoff_to: [complaint, tech_support]
+    reflection: self_check
+
+  complaint:
+    prompt_id: agents/complaint_system
+    model_key: model_complex
+    tools:
+      - tool:get_customer_info    # 细粒度：CRM 只给读，不给全量
+      - tool:update_customer_tag
+      - server:ticket             # 工单 server 全部工具
+    can_handoff_to: [order]
+    reflection: judge
+
+  tech_support:
+    prompt_id: agents/tech_support_system
+    model_key: model_main
+    tools:
+      - server:knowledge
+      - tool:create_ticket        # 细粒度：只给建单，不给改单/赔偿
+    can_handoff_to: [order, complaint]
+    reflection: self_check

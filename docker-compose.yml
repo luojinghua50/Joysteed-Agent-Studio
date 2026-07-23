@@ -1,0 +1,417 @@
+services:
+  # ===== agent-core =====
+  agent-core:
+    build: ./agent-core
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/agent_core
+      - LITELLM_BASE_URL=http://litellm:4000
+      - KNOWLEDGE_MCP_URL=http://knowledge-mcp:8001/mcp
+      - ORDER_MCP_URL=http://order-mcp:8002/mcp
+      - TICKET_MCP_URL=http://ticket-mcp:8003/mcp
+      - CRM_MCP_URL=http://crm-mcp:8004/mcp
+      - LANGFUSE_HOST=http://langfuse:3000
+      - LANGFUSE_PUBLIC_KEY=pk-lf-agent-studio
+      - LANGFUSE_SECRET_KEY=sk-lf-agent-studio
+      # OTLP 出口走 otel-collector（再由 collector 扇出给 Tempo + Langfuse）。
+      # collector 内网无需鉴权；到 Langfuse 的 Basic 头由 collector 侧补。
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: unless-stopped
+
+  # ===== agent-tools MCP Servers =====
+  knowledge-mcp:
+    build:
+      context: ./agent-tools
+      dockerfile: Dockerfile
+    command: python -m knowledge_server.server
+    ports:
+      - "8001:8001"
+    environment:
+      - RAG_SERVICE_URL=http://agent-rag:8010
+    depends_on:
+      - agent-rag
+    restart: unless-stopped
+
+  order-mcp:
+    build:
+      context: ./agent-tools
+      dockerfile: Dockerfile
+    command: python -m order_server.server
+    ports:
+      - "8002:8002"
+    environment:
+      - ORDER_DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/agent_core
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  ticket-mcp:
+    build:
+      context: ./agent-tools
+      dockerfile: Dockerfile
+    command: python -m ticket_server.server
+    ports:
+      - "8003:8003"
+    environment:
+      - TICKET_DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/agent_core
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  crm-mcp:
+    build:
+      context: ./agent-tools
+      dockerfile: Dockerfile
+    command: python -m crm_server.server
+    ports:
+      - "8004:8004"
+    restart: unless-stopped
+
+  # ===== agent-rag =====
+  agent-rag:
+    build: ./agent-rag
+    ports:
+      - "8010:8010"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/agent_rag
+      # 检索后端：真实向量链路
+      - RETRIEVAL_BACKEND=milvus
+      - MILVUS_HOST=milvus
+      - MILVUS_PORT=19530
+      - MILVUS_COLLECTION=rag_chunks
+      # embedding 本地 fastembed (ONNX, 无需 torch/外网；上游中转不提供 embedding)
+      - EMBEDDING_PROVIDER=fastembed
+      - EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
+      - EMBEDDING_DIM=512
+      # rerank 本地 cross-encoder：RRF 权重粗排之后的语义精排（缺省/异常自动降级回 RRF）
+      - RERANK_PROVIDER=fastembed
+      - RERANK_MODEL=BAAI/bge-reranker-base
+      - RERANK_CANDIDATE_N=20
+      # 首次启动从 HF 国内镜像下载 ONNX 模型 (容器无 IPv6 路由，huggingface.co 不可达)
+      - HF_ENDPOINT=https://hf-mirror.com
+      # 持久化 HuggingFace / fastembed 缓存，避免每次重建都重新联网拉 rerank/embedding 模型
+      - HF_HOME=/models/huggingface
+      - HUGGINGFACE_HUB_CACHE=/models/huggingface/hub
+      - FASTEMBED_CACHE_PATH=/models/fastembed
+      # 禁用 Xet 存储：大文件经 cas-bridge.xethub.hf.co 不被镜像代理，强制走 LFS resolve
+      - HF_HUB_DISABLE_XET=1
+      # 原始文件入对象存储
+      - MINIO_ENABLED=true
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minio
+      - MINIO_SECRET_KEY=minio123
+      - MINIO_BUCKET=rag-documents
+    volumes:
+      - rag_model_cache:/models
+    depends_on:
+      - postgres
+      - milvus
+    restart: unless-stopped
+
+  # ===== agent-web =====
+  agent-web:
+    build: ./agent-web
+    ports:
+      - "3001:80"
+    depends_on:
+      - agent-core
+    restart: unless-stopped
+
+  # ===== agent-admin (RAG 知识库管理后台) =====
+  agent-admin:
+    build: ./agent-admin
+    ports:
+      - "3003:80"
+    depends_on:
+      - agent-rag
+    restart: unless-stopped
+
+  # ===== agent-desk (坐席工作台:工单/人工接管/外呼) =====
+  agent-desk:
+    build: ./agent-desk
+    ports:
+      - "3005:80"
+    depends_on:
+      - ticket-mcp
+      - agent-core
+    restart: unless-stopped
+
+  # ===== Infrastructure =====
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=agent_core
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./db-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./litellm_config.yaml:/app/config.yaml
+    command: --config /app/config.yaml
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      # LLM_API_BASE 未设置时默认官方 Anthropic；填中转地址即走中转
+      - LLM_API_BASE=${LLM_API_BASE:-https://api.anthropic.com}
+    restart: unless-stopped
+
+  # ===== Observability =====
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "9100:9000"
+    environment:
+      - MINIO_ROOT_USER=minio
+      - MINIO_ROOT_PASSWORD=minio123
+    command: server /data
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minio minio123 &&
+      mc mb --ignore-existing local/langfuse &&
+      mc mb --ignore-existing local/milvus &&
+      mc mb --ignore-existing local/rag-documents &&
+      exit 0
+      "
+
+  # ===== Milvus (向量库) 及其依赖 etcd；复用现有 minio 作对象存储 =====
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.18
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    volumes:
+      - etcd_data:/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    restart: unless-stopped
+
+  milvus:
+    image: milvusdb/milvus:v2.6.13
+    command: ["milvus", "run", "standalone"]
+    environment:
+      - ETCD_ENDPOINTS=etcd:2379
+      - MINIO_ADDRESS=minio:9000
+      - MINIO_ACCESS_KEY_ID=minio
+      - MINIO_SECRET_ACCESS_KEY=minio123
+      - MINIO_BUCKET_NAME=milvus
+    ports:
+      - "19530:19530"
+    depends_on:
+      etcd:
+        condition: service_started
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 90s
+    restart: unless-stopped
+
+  langfuse:
+    image: langfuse/langfuse:3
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/langfuse
+      - CLICKHOUSE_URL=http://clickhouse:8123
+      - CLICKHOUSE_MIGRATION_URL=clickhouse://clickhouse:9000
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=default
+      - CLICKHOUSE_CLUSTER_ENABLED=false
+      - LANGFUSE_S3_EVENT_UPLOAD_BUCKET=langfuse
+      - LANGFUSE_S3_EVENT_UPLOAD_REGION=us-east-1
+      - LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID=minio
+      - LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY=minio123
+      - LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT=http://minio:9000
+      - LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE=true
+      - REDIS_CONNECTION_STRING=redis://redis:6379
+      - LANGFUSE_WORKER_PASSWORD=worker-secret
+      - LANGFUSE_WORKER_HOST=http://localhost:3000
+      - LANGFUSE_WORKER_ID=worker-1
+      - LANGFUSE_INGESTION_QUEUE_DELAY_MS=100
+      - NEXTAUTH_SECRET=langfuse-secret-key
+      - NEXTAUTH_URL=http://localhost:3000
+      - SALT=langfuse-salt-value
+      - TELEMETRY_ENABLED=false
+      - LANGFUSE_INIT_ORG_ID=agent-studio
+      - LANGFUSE_INIT_ORG_NAME=Agent Studio
+      - LANGFUSE_INIT_PROJECT_ID=agent-core
+      - LANGFUSE_INIT_PROJECT_NAME=Agent Core
+      - LANGFUSE_INIT_PROJECT_PUBLIC_KEY=pk-lf-agent-studio
+      - LANGFUSE_INIT_PROJECT_SECRET_KEY=sk-lf-agent-studio
+      - LANGFUSE_INIT_USER_EMAIL=admin@agent-studio.local
+      - LANGFUSE_INIT_USER_PASSWORD=admin123
+      - LANGFUSE_INIT_USER_NAME=Admin
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/langfuse
+      - CLICKHOUSE_URL=http://clickhouse:8123
+      - CLICKHOUSE_MIGRATION_URL=clickhouse://clickhouse:9000
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=default
+      - CLICKHOUSE_CLUSTER_ENABLED=false
+      - LANGFUSE_S3_EVENT_UPLOAD_BUCKET=langfuse
+      - LANGFUSE_S3_EVENT_UPLOAD_REGION=us-east-1
+      - LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID=minio
+      - LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY=minio123
+      - LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT=http://minio:9000
+      - LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE=true
+      - REDIS_CONNECTION_STRING=redis://redis:6379
+      - SALT=langfuse-salt-value
+      - TELEMETRY_ENABLED=false
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24-alpine
+    ports:
+      - "8123:8123"
+    environment:
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=default
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    cap_add:
+      - SYS_NICE
+      - IPC_LOCK
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://127.0.0.1:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3002:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+      - tempo
+    restart: unless-stopped
+
+  tempo:
+    image: grafana/tempo:latest
+    ports:
+      - "3200:3200"
+      - "4317:4317"
+    volumes:
+      - ./observability/tempo.yml:/etc/tempo/tempo.yml
+      - tempo_data:/var/tempo
+    command: ["-config.file=/etc/tempo/tempo.yml"]
+    restart: unless-stopped
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    ports:
+      - "4318:4318"
+    volumes:
+      - ./observability/otel-collector.yml:/etc/otelcol/config.yaml
+    command: ["--config=/etc/otelcol/config.yaml"]
+    depends_on:
+      - tempo
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  rag_model_cache:
+  redis_data:
+  pg_data:
+  prometheus_data:
+  grafana_data:
+  tempo_data:
+  clickhouse_data:
+  minio_data:
+  etcd_data:
