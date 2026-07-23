@@ -24,7 +24,7 @@ Joysteed Agent Studio is a **ready-to-run AI customer service system**: a custom
 This is not a toy demo. It's an engineering reference that lands the hard parts all at once: **multi-agent orchestration, retrieval augmentation, tool governance, stability fallbacks, and end-to-end observability.**
 
 <div align="center">
-  <img src="docs/images/multi-intent-chat.png" alt="Joysteed Agent Studio multi-intent conversation" width="800" />
+  <img src="docs/images/multi-intent-chat.png" alt="Joysteed Agent Studio multi-intent conversation" width="400" />
   <br/>
   <em>A single message carries multiple intents — the supervisor fans them out to different business agents that respond cooperatively</em>
 </div>
@@ -37,6 +37,12 @@ This is not a toy demo. It's an engineering reference that lands the hard parts 
 - **Least-privilege tool authorization** — MCP tools can be granted per `server:` group or per single `tool:`, with fine-grained control over sensitive operations (e.g. refunds).
 - **A real RAG pipeline** — Milvus vector store + local fastembed embeddings + cross-encoder reranking, auto-degrading to RRF hybrid retrieval on failure.
 - **End-to-end observability** — Langfuse traces LLM calls, OpenTelemetry → Tempo/Grafana for traces, Prometheus for metrics.
+
+<div align="center">
+  <img src="docs/images/langfuse-llm.png" alt="Langfuse LLM call tracing" width="800" />
+  <br/>
+  <em>Langfuse records every LLM call's input/output, token usage, latency, and cost — the full trace at a glance</em>
+</div>
 
 ## ✨ Core Capabilities
 

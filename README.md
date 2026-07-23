@@ -24,7 +24,7 @@ Joysteed Agent Studio 是一个**开箱即用的智能客服系统**:客户在�
 它不是一个玩具 demo,而是把**多 Agent 编排、检索增强、工具治理、稳定性兜底、全链路可观测**这几件难事一次性落地的工程参考。
 
 <div align="center">
-  <img src="docs/images/multi-intent-chat.png" alt="Joysteed Agent Studio 多意图对话" width="800" />
+  <img src="docs/images/multi-intent-chat.png" alt="Joysteed Agent Studio 多意图对话" width="400" />
   <br/>
   <em>客户一句话包含多个意图,Supervisor 并行分派给不同业务 Agent 协同应答</em>
 </div>
@@ -37,6 +37,12 @@ Joysteed Agent Studio 是一个**开箱即用的智能客服系统**:客户在�
 - **工具按最小权限授权** —— MCP 工具可按 `server:` 整组或 `tool:` 单个粒度授权,敏感操作(如退款)细粒度控制。
 - **真实 RAG 链路** —— Milvus 向量库 + 本地 fastembed 嵌入 + cross-encoder 精排,异常自动降级回 RRF 混合检索。
 - **全链路可观测** —— Langfuse 追踪 LLM 调用,OpenTelemetry → Tempo/Grafana 看 trace,Prometheus 看指标。
+
+<div align="center">
+  <img src="docs/images/langfuse-llm.png" alt="Langfuse LLM 调用追踪" width="800" />
+  <br/>
+  <em>Langfuse 记录每次 LLM 调用的输入输出、token 消耗、延迟与成本,链路一目了然</em>
+</div>
 
 ## ✨ 核心能力
 

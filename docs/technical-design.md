@@ -1397,6 +1397,20 @@ async def enrich_state_with_memory(state: CustomerState, memory_manager: MemoryM
 
 两者的 endpoint/host 均由配置注入,实际实现见 `src/observability`。
 
+### 11.4 效果展示
+
+**LLM 调用追踪** —— Langfuse 记录每次 LLM 调用的输入输出、token 消耗、延迟与成本,便于定位慢调用与优化 prompt。
+
+<div align="center">
+  <img src="images/langfuse-llm.png" alt="Langfuse LLM 调用追踪" width="800" />
+</div>
+
+**Agent 链路追踪** —— 一次对话从 Supervisor 分派到各业务 Agent、工具调用、模型生成的完整 trace 一目了然,层级清晰。
+
+<div align="center">
+  <img src="images/langfuse-tracing.png" alt="Langfuse Agent 链路追踪" width="800" />
+</div>
+
 ---
 
 ## 十二、高并发设计
