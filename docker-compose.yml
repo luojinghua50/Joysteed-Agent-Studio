@@ -185,6 +185,11 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       # LLM_API_BASE 未设置时默认官方 Anthropic；填中转地址即走中转
       - LLM_API_BASE=${LLM_API_BASE:-https://api.anthropic.com}
+      # Langfuse 上报（litellm 的 success/failure_callback 读这几个环境变量）。
+      # 与 agent-core 指向同一 Langfuse 实例，便于并排对照 fallback 记录。
+      - LANGFUSE_HOST=http://langfuse:3000
+      - LANGFUSE_PUBLIC_KEY=pk-lf-agent-studio
+      - LANGFUSE_SECRET_KEY=sk-lf-agent-studio
     restart: unless-stopped
 
   # ===== Observability =====
