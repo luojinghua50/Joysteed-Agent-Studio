@@ -13,6 +13,7 @@ services:
       - ORDER_MCP_URL=http://order-mcp:8002/mcp
       - TICKET_MCP_URL=http://ticket-mcp:8003/mcp
       - CRM_MCP_URL=http://crm-mcp:8004/mcp
+      - SKILL_MCP_URL=http://skill-mcp:8005/mcp
       - LANGFUSE_HOST=http://langfuse:3000
       - LANGFUSE_PUBLIC_KEY=pk-lf-agent-studio
       - LANGFUSE_SECRET_KEY=sk-lf-agent-studio
@@ -75,6 +76,22 @@ services:
     command: python -m crm_server.server
     ports:
       - "8004:8004"
+    restart: unless-stopped
+
+  # 编排型 skill server：自身作为 MCP 客户端去调 knowledge/order，封装多步业务动作
+  skill-mcp:
+    build:
+      context: ./agent-tools
+      dockerfile: Dockerfile
+    command: python -m skill_server.server
+    ports:
+      - "8005:8005"
+    environment:
+      - KNOWLEDGE_MCP_URL=http://knowledge-mcp:8001/mcp
+      - ORDER_MCP_URL=http://order-mcp:8002/mcp
+    depends_on:
+      - knowledge-mcp
+      - order-mcp
     restart: unless-stopped
 
   # ===== agent-rag =====

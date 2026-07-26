@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     order_mcp_url: str = "http://localhost:8002/mcp"
     ticket_mcp_url: str = "http://localhost:8003/mcp"
     crm_mcp_url: str = "http://localhost:8004/mcp"
+    skill_mcp_url: str = "http://localhost:8005/mcp"  # 编排型 server：封装多步业务动作
 
     # Security
     jwt_secret: str = "dev-secret-key-change-in-production"

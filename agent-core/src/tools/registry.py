@@ -23,4 +23,6 @@ TOOL_SERVER_MAP: dict[str, str] = {
     "apply_compensation": "ticket",
     "get_customer_info": "crm",
     "update_customer_tag": "crm",
+    # 编排型 skill（skill_server）：内部只读地调 order+knowledge，封装成单个动作
+    "diagnose_fault": "skill",
 }
