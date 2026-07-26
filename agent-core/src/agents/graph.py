@@ -33,9 +33,15 @@ def create_llm(settings: Settings, model_name: str | None = None) -> ChatOpenAI:
 
 
 def build_graph(
-    settings=None, memory_manager=None, prompts=None, mcp=None, approval_enabled: bool | None = None
+    settings=None, memory_manager=None, prompts=None, mcp=None,
+    approval_enabled: bool | None = None, error_store=None,
 ) -> StateGraph:
-    """Build the main agent orchestration graph (data-driven + multi-intent)."""
+    """Build the main agent orchestration graph (data-driven + multi-intent).
+
+    error_store 非空时启用 L2 自我反思：构建 judge（Opus，judge_model）+
+    ReflectionContext，注入 agent_node（A）/synthesize_node（C）/execute_node（B）。
+    为空则三节点行为与接入前完全一致（reflection=None，一行不变）。
+    """
     if settings is None:
         settings = Settings()
     if mcp is None:
@@ -48,6 +54,22 @@ def build_graph(
         else approval_enabled
     )
 
+    # —— L2 反思上下文（仅当注入 error_store 时启用）——
+    reflection = None
+    if error_store is not None:
+        from src.config import ReflectionConfig
+        from src.reflection.judge import JudgeReflector
+        from src.reflection.loop import ReflectionContext
+
+        reflection_cfg = ReflectionConfig()
+        if reflection_cfg.enabled:
+            judge_llm = create_llm(settings, reflection_cfg.judge_model)
+            reflection = ReflectionContext(
+                judge=JudgeReflector(config=reflection_cfg, llm=judge_llm),
+                error_store=error_store,
+                config=reflection_cfg,
+            )
+
     graph = StateGraph(CustomerState)
 
     # —— 特例节点：supervisor（纯 LLM 路由/分解）、human_handoff（无 LLM） ——
@@ -58,7 +80,8 @@ def build_graph(
 
     # —— 多意图编排节点 ——
     graph.add_node(
-        "synthesize", partial(synthesize_node, llm=create_llm(settings, settings.model_main))
+        "synthesize",
+        partial(synthesize_node, llm=create_llm(settings, settings.model_main), reflection=reflection),
     )
 
     # —— 单意图交接 chokepoint：+1 计数 + 审计，再路由到目标 agent ——
@@ -75,7 +98,10 @@ def build_graph(
         return create_llm(settings, model)
 
     graph.add_node("approval", approval_node)
-    graph.add_node("execute", partial(execute_node, make_llm=make_llm, mcp=mcp, prompts=prompts))
+    graph.add_node(
+        "execute",
+        partial(execute_node, make_llm=make_llm, mcp=mcp, prompts=prompts, reflection=reflection),
+    )
 
     # 业务 Agent 全部由 registry 循环生成 —— 新增一行 spec 即接入，无需改本函数
     for name, spec in AGENT_REGISTRY.items():
@@ -89,6 +115,7 @@ def build_graph(
                 mcp=mcp,
                 prompts=prompts,
                 approval_enabled=approval_enabled,
+                reflection=reflection,
             ),
         )
 
@@ -167,13 +194,16 @@ def build_graph(
 
 
 def compile_graph(
-    settings: Settings | None = None, memory_manager=None, prompts=None, mcp=None, checkpointer=None
+    settings: Settings | None = None, memory_manager=None, prompts=None, mcp=None,
+    checkpointer=None, error_store=None,
 ):
     """Compile the graph for execution.
 
     审批闸依赖 checkpointer 才能 interrupt/resume（暂停后按 thread_id 恢复）。
     未显式传入时，若 approval_enabled 则默认用进程内 MemorySaver（生产使用持久化
     saver，如Postgres，以便跨进程恢复）。
+
+    error_store 透传给 build_graph 启用 L2 自我反思（见 build_graph）。
     """
     if settings is None:
         settings = Settings()
@@ -181,5 +211,5 @@ def compile_graph(
         from langgraph.checkpoint.memory import MemorySaver
 
         checkpointer = MemorySaver()
-    graph = build_graph(settings, memory_manager, prompts=prompts, mcp=mcp)
+    graph = build_graph(settings, memory_manager, prompts=prompts, mcp=mcp, error_store=error_store)
     return graph.compile(checkpointer=checkpointer)

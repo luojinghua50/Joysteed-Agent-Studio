@@ -34,10 +34,21 @@ async def _resolve_prompt(spec: AgentSpec, prompts) -> str:
 
 
 async def agent_node(state: CustomerState, *, spec: AgentSpec, llm, mcp: MCPClientManager,
-                     prompts=None, approval_enabled: bool = False) -> dict:
-    """所有业务 Agent 共用的执行体，行为差异全部来自 AgentSpec 数据。"""
+                     prompts=None, approval_enabled: bool = False, reflection=None) -> dict:
+    """所有业务 Agent 共用的执行体，行为差异全部来自 AgentSpec 数据。
+
+    reflection（ReflectionContext）非空且本 agent 策略为 judge 时，对**单意图正常
+    回复**（A 路径）做 L2 仲裁 + bounded 重写。多意图分支不在此判——它只写
+    agent_results，终端回复在 synthesize 融合后产生，judge 放那里（C 路径）。
+    """
     is_multi = state.get("is_multi_intent", False)
     sub_query = state.get("_sub_query")
+    # A 路径开关：有反思依赖、本 agent 标为 judge、且是单意图（多意图交给 C 路径）
+    do_judge = (
+        reflection is not None
+        and spec.reflection == "judge"
+        and not is_multi
+    )
 
     # 多意图模式下用该子意图改写后的独立诉求；单意图沿用历史窗口
     if is_multi and sub_query:
@@ -69,10 +80,15 @@ async def agent_node(state: CustomerState, *, spec: AgentSpec, llm, mcp: MCPClie
     protected = APPROVAL_REQUIRED_TOOLS if approval_enabled else set()
 
     try:
-        response: AIMessage = await run_agent_with_tools(
+        # A 路径需要 transcript（bounded 重写复用，不重跑工具）+ 工具结果（judge 评估）
+        exec_out = await run_agent_with_tools(
             llm=llm, tools=tools, system_prompt=prompt, messages=messages,
-            protected_tools=protected,
+            protected_tools=protected, return_transcript=do_judge,
         )
+        if do_judge:
+            response, working_messages, tool_results = exec_out
+        else:
+            response, working_messages, tool_results = exec_out, None, None
     except ApprovalRequired as ar:
         # 敏感写工具待确认：写副作用尚未落地——execute 节点在批准后才执行。
         if is_multi:
@@ -110,5 +126,18 @@ async def agent_node(state: CustomerState, *, spec: AgentSpec, llm, mcp: MCPClie
     target = detect_handoff(response.content, allowed=spec.can_handoff_to)
     if target:
         return {"resolved": False, "handoff_target": target, "current_agent": spec.name}
+
+    # A 路径 L2 仲裁：仅对不含交接的终端回复做 judge + bounded 重写（不重跑工具）。
+    if do_judge:
+        from src.reflection.loop import judge_prewrite
+
+        last_user = messages[-1].content if messages else ""
+        response = await judge_prewrite(
+            reflection.judge, reflection.error_store,
+            agent=spec.name, skill=None, user_msg=last_user,
+            tool_results=[tool_results] if tool_results else [],
+            working_messages=working_messages, reword_llm=llm,
+            max_retries=reflection.max_retries,
+        )
 
     return {"messages": [response], "resolved": True, "current_agent": spec.name}

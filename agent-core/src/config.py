@@ -21,6 +21,13 @@ class Settings(BaseSettings):
     # 关闭时行为与改造前完全一致（工具直连执行），故对现有流程零影响、可灰度。
     approval_enabled: bool = True
 
+    # L2 自我反思（judge 仲裁 + 错误记忆持久化）总开关。默认关闭：LLM judge 无
+    # ground truth，抓不到资损类真错，能抓的（泄露/过度承诺）已被 OutputFilter/prompt
+    # 覆盖，成本/延迟不划算。开启后由 SqlErrorMemoryStore 注入图，对 complaint/退款
+    # 高危场景做仲裁（触发范围见 ReflectionConfig.agent_policies/skill_policies）。
+    # 关闭时三节点 reflection=None，行为与接入前逐行一致。
+    reflection_enabled: bool = False
+
     # Redis
     redis_url: str = "redis://localhost:6379/0"
 

@@ -54,6 +54,28 @@ def _resolve_decision(decision, call_id: str) -> bool:
     return bool(decision)
 
 
+async def _judge_refund_reply(reflection, agent: str, user_msg: str,
+                              results: dict, resp: AIMessage) -> AIMessage:
+    """B 路径：退款成功时对确认文案做 L2 仲裁，失败走确定性模板。
+
+    仅当 apply_refund 真正执行且返回成功（无 error 键）才触发；工具返回 error 时
+    不改文案（保留模型对失败的说明，人工按需介入）。无 reflection 注入则原样返回。
+    """
+    if reflection is None:
+        return resp
+    refund_result = (results or {}).get("apply_refund")
+    if not isinstance(refund_result, dict) or refund_result.get("error"):
+        return resp  # 未退款/退款失败：不走质量闸
+
+    from src.reflection.loop import judge_postwrite, REFUND_SKILL
+
+    return await judge_postwrite(
+        reflection.judge, reflection.error_store,
+        agent=agent, skill=REFUND_SKILL, user_msg=user_msg,
+        tool_result=refund_result, response=resp,
+    )
+
+
 async def approval_node(state: CustomerState) -> dict:
     """人工确认闸：interrupt 暂停图，等 /approve 带决定 resume。不调 LLM。
 
@@ -93,12 +115,16 @@ async def approval_node(state: CustomerState) -> dict:
 
 
 async def _execute_one_agent(
-    agent: str, pw: dict, decision, *, make_llm, mcp, session_id: str
+    agent: str, pw: dict, decision, *, make_llm, mcp, session_id: str,
+    reflection=None, user_msg: str = "",
 ) -> AIMessage:
     """逐 agent 落地被批准的写并生成回复（多意图批量栅栏用）。
 
     approved 的写幂等去重后执行；被拒/去重的写作为 stub 补占位 ToolMessage，
     保证 tool_call/ToolMessage 配对约束。返回该 agent 的最终回复。
+
+    B 路径：若本 agent 执行了 apply_refund（写已不可逆），对生成的退款确认文案做
+    L2 仲裁——不合格走确定性模板兜底，绝不重写、不重跑写。
     """
     calls = pw.get("pending_calls", [])
     working_messages = pw.get("working_messages", [])
@@ -120,31 +146,44 @@ async def _execute_one_agent(
         await guard.store_result(session_id, c["name"], c["args"], {"approved": True})
 
     llm = make_llm(agent)
-    resp = await execute_pending_writes(
-        llm, tool_map, list(working_messages), executable, stub_calls=stubs
+    resp, results = await execute_pending_writes(
+        llm, tool_map, list(working_messages), executable, stub_calls=stubs,
+        return_results=True,
     )
     logger.info(
         "approval_executed_agent", agent=agent,
         approved=[c["name"] for c in executable], rejected=[c["name"] for c in stubs],
     )
-    return resp
+    return await _judge_refund_reply(reflection, agent, user_msg, results, resp)
 
 
-async def execute_node(state: CustomerState, *, make_llm, mcp, prompts=None) -> dict:
+def _last_user_msg(state: CustomerState) -> str:
+    """取最近一条用户消息（B 路径 judge 评估用）。"""
+    for msg in reversed(state.get("messages") or []):
+        if getattr(msg, "type", None) == "human":
+            return getattr(msg, "content", "")
+    return ""
+
+
+async def execute_node(state: CustomerState, *, make_llm, mcp, prompts=None, reflection=None) -> dict:
     """审批后落地：批准则执行写工具 + 生成回复；拒绝则取消。
 
     多意图批量栅栏：逐 agent 落地被批准的写、生成回复写入 agent_results（该 agent
     转 done），不清 pending_writes（靠 done 过滤），返回后回 dispatch 评估剩余子意图。
     单意图：沿用原路径，清空 pending_write，→ END。
+
+    B 路径：apply_refund 执行后的退款确认文案经 _judge_refund_reply 做 L2 仲裁。
     """
     pending = _pending_by_agent(state)
+    user_msg = _last_user_msg(state)
     if pending:
         session_id = state.get("session_id", "")
         decision = state.get("approval_decision")
         results = {}
         for agent, pw in pending.items():
             resp = await _execute_one_agent(
-                agent, pw, decision, make_llm=make_llm, mcp=mcp, session_id=session_id
+                agent, pw, decision, make_llm=make_llm, mcp=mcp, session_id=session_id,
+                reflection=reflection, user_msg=user_msg,
             )
             results[agent] = {"message": resp}
         # 写入 agent_results → 这些 agent 转 done，dispatch 据此推进剩余波次
@@ -186,8 +225,11 @@ async def execute_node(state: CustomerState, *, make_llm, mcp, prompts=None) -> 
         await guard.store_result(session_id, c["name"], c["args"], {"approved": True})
 
     llm = make_llm(agent)
-    response = await execute_pending_writes(llm, tool_map, list(working_messages), executable)
+    response, results = await execute_pending_writes(
+        llm, tool_map, list(working_messages), executable, return_results=True
+    )
     logger.info("approval_executed", agent=agent, tools=[c["name"] for c in executable])
+    response = await _judge_refund_reply(reflection, agent, user_msg, results, response)
     return {
         "messages": [response],
         "resolved": True,

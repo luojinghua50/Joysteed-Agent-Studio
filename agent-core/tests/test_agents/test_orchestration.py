@@ -371,7 +371,8 @@ class TestAgentNodeHandoffRuleInjection:
         """跑一次 agent_node，返回传给 run_agent_with_tools 的 system_prompt。"""
         captured = {}
 
-        async def _fake_run(*, llm, tools, system_prompt, messages, protected_tools=None):
+        async def _fake_run(*, llm, tools, system_prompt, messages,
+                            protected_tools=None, return_transcript=False):
             captured["prompt"] = system_prompt
             return AIMessage(content="ok")
 

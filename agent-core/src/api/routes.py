@@ -68,8 +68,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         mcp = MCPClientManager(settings)
         app.state.mcp = mcp
 
+        # L2 自我反思（judge 仲裁 + 错误记忆持久化）总开关：settings.reflection_enabled
+        # （默认 False，见 Settings 注释）。开启则注入 SqlErrorMemoryStore，图内三节点
+        # 对 complaint/退款高危场景做仲裁；关闭则 error_store=None，行为与接入前逐行一致。
+        error_store = None
+        if settings.reflection_enabled:
+            from src.reflection.error_memory import SqlErrorMemoryStore
+            error_store = SqlErrorMemoryStore(app.state.db_session_factory)
+            logger.info("reflection_enabled")
+        app.state.error_store = error_store
         app.state.graph = compile_graph(settings, memory_manager, prompts=prompts,
-                                        mcp=mcp, checkpointer=checkpointer)
+                                        mcp=mcp, checkpointer=checkpointer,
+                                        error_store=error_store)
 
         # 启动预热：把各 agent 工具清单拉满缓存，冷启动延迟从用户请求路径挪到此处。
         # 绝不阻断启动 —— agent-tools 未就绪时仅记 warning，首次请求再自愈。

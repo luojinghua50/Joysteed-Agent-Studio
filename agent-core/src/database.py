@@ -1,7 +1,7 @@
 """Database layer: SQLAlchemy async models and engine initialization."""
 from datetime import datetime
 
-from sqlalchemy import String, Text, DateTime, ForeignKey, func
+from sqlalchemy import String, Text, DateTime, ForeignKey, Integer, func
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -46,6 +46,26 @@ class MessageModel(Base):
     timestamp: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     session: Mapped["SessionModel"] = relationship(back_populates="messages")
+
+
+class ErrorRecordModel(Base):
+    """A judge-rejected agent response, persisted so the reflection loop learns
+    across process restarts (the in-memory ``ErrorMemoryStore`` loses these on
+    restart). Injected back into high-risk agents' prompts as 历史错误/禁止事项.
+
+    ``issues`` is stored as a newline-joined string (SQLite/Postgres portable);
+    the store splits it back into a list on read."""
+    __tablename__ = "error_records"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    agent: Mapped[str] = mapped_column(String(64), index=True)
+    skill: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    user_message: Mapped[str] = mapped_column(Text)
+    failed_response: Mapped[str] = mapped_column(Text)
+    issues: Mapped[str] = mapped_column(Text, default="")
+    suggestion: Mapped[str] = mapped_column(Text, default="")
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
 
 
 async def init_db(database_url: str) -> async_sessionmaker[AsyncSession]:
