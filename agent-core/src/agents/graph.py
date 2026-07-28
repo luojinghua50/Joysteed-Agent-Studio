@@ -54,6 +54,10 @@ def build_graph(
         else approval_enabled
     )
 
+    # 工作记忆句柄：从 memory_manager 取 WorkingMemory，注入业务/执行节点写实体。
+    # 为空则节点不写工作记忆（行为与接入前一致）。
+    working = getattr(memory_manager, "working", None) if memory_manager is not None else None
+
     # —— L2 反思上下文（仅当注入 error_store 时启用）——
     reflection = None
     if error_store is not None:
@@ -100,7 +104,8 @@ def build_graph(
     graph.add_node("approval", approval_node)
     graph.add_node(
         "execute",
-        partial(execute_node, make_llm=make_llm, mcp=mcp, prompts=prompts, reflection=reflection),
+        partial(execute_node, make_llm=make_llm, mcp=mcp, prompts=prompts,
+                reflection=reflection, memory=working),
     )
 
     # 业务 Agent 全部由 registry 循环生成 —— 新增一行 spec 即接入，无需改本函数
@@ -116,6 +121,7 @@ def build_graph(
                 prompts=prompts,
                 approval_enabled=approval_enabled,
                 reflection=reflection,
+                memory=working,
             ),
         )
 

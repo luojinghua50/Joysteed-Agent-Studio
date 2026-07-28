@@ -711,3 +711,105 @@ src/memory/
 ├── checkpointer.py           # LangGraph Checkpoint
 └── conversation.py           # 多轮对话管理
 ```
+
+---
+
+## 十、实现现状与设计确认
+
+> 前面 1~8 章是**目标设计**，其中部分模块（triggers.py / conflict_resolver.py / maintenance.py 等）尚未落地。本章记录**已实现并验证**的真实设计与关键决策，与代码一一对应。凡与前文不一致处，以本章为准。
+
+### 10.0 已实现 vs 未实现
+
+| 能力 | 状态 | 说明 |
+|------|------|------|
+| 短期记忆：消息落库 + 滚动摘要 + LIMIT 加载 | ✅ 已实现 | `short_term.py` |
+| 工作记忆：Redis + 工具结果规则抽实体 | ✅ 已实现 | `working.py` + `entities.py` |
+| 长期-画像/事实/历史：SQLAlchemy 持久化 | ✅ 已实现 | `long_term/*` + `database.py` |
+| 长期-历史：Milvus 向量语义检索 + 时间衰减 | ✅ 已实现 | `episodic.py` |
+| 事实置信度衰减 + 分档标注 | ✅ 已实现 | `decay.py` |
+| 归档：复用短期摘要 + facts/profile 增量抽取 | ✅ 已实现 | `manager.py`（做法1）|
+| 会话结束触发：`/end` 接口 | ✅ 已实现 | `routes.py` |
+| 超时兜底归档 | ⚠️ 函数备好、未接调度 | `archive_idle_sessions`，生产需 CronJob |
+| CRM webhook 同步 / 冲突解决器 / 定时维护任务 | ❌ 未实现 | 见前文目标设计 |
+
+### 10.1 短期记忆：滚动摘要 + LIMIT 加载
+
+**存储分工（两张表）**：
+- `messages` 表：全量对话原文，一条消息一行，**只增不改**（`/history` 展示、审计用）。
+- `sessions` 表：一个 session 一行，`summary`（老消息滚动摘要）+ `summary_upto_id`（摘要已覆盖到的最大 message id，0=无摘要）两列**更新覆盖**，不新增。
+
+**加载（每轮，热路径）** `ShortTermMemory.load`：
+```
+recent = SELECT * FROM messages
+         WHERE session_id=? AND id > summary_upto_id   -- 只取未压缩原文
+         ORDER BY id DESC LIMIT load_limit(30)          -- 带 LIMIT，防全量
+         → reverse 还原时间序
+返回 (recent 原文, sessions.summary 摘要)
+```
+- `summary_upto_id`（简称 upto）是分界线：id ≤ upto 已压进摘要，id > upto 是原文。
+- `load_limit=30` 是**安全上界**（≥ 最大 history_window 10），不是精确需求——因加载发生在路由前、不知走哪个 agent（各 agent history_window 不同），故取够所有下游用的公共供给，各 agent 再自行 `[-history_window:]` 切 5~10 条。
+
+**压缩（回合结束，非热路径）** `ShortTermMemory.compress_if_needed`：
+- 先一次廉价 `COUNT(id > upto)`，`< trigger(30)` 直接返回、**不调 LLM**（绝大多数回合走这里，仅一次 COUNT 开销）。
+- `≥ trigger` 才把最老的 `(总数 - keep(10))` 条交 LLM 融合进 `summary`，`upto` 前移。返回被压批次供增量事实抽取。
+
+**为何摘要放进 `memory_context`（SystemMessage）而非消息列表**：
+`state["messages"]` 会被各 agent `[-history_window:]` 切成最近 10 条；摘要代表**最老**的历史、天然在列表开头，一放进去就被切掉。而 `memory_context` 拼进 SystemMessage（`[SystemMessage(prompt+摘要), *messages]`），**不经过窗口切割**，无论对话多长都保留。
+
+**加载不变量**：`摘要(≤upto) + 原文(>upto)`，无 gap、无重叠。
+
+### 10.2 工作记忆：Redis + 工具结果规则抽实体
+
+- **存储**：Redis Hash，key = `working:{session_id}`（一会话一 key），field=实体名、value=`json.dumps(值)`（保住类型：amount 是 float 不是 "299.0"）。TTL `working_memory_ttl(3600s)`。Redis 不可达 → 降级内存 dict。
+- **写入**：`entities.py::extract_entities` **规则直取**（非 LLM）——从工具返回结果里取 `order_id/refund_id/amount/status/carrier` 等已知字段。在 `agent_node` / `execute_node` 工具跑完后调用。
+  - 关键点：MCP 读工具经 adapter 序列化为 **JSON 字符串**，写工具（apply_refund）是 **dict**——`extract_entities` 两种都吃（字符串先 `json.loads`）。
+  - 语义：同名覆盖、异名新增（`hset`），是"当前焦点便签"，非只增日志。
+- **定位（重要设计取舍）**：主流 agent 记忆框架（MemGPT/Letta 等）**不把结构化实体缓存单列一层**。本项目的工作记忆真正价值仅在"指代消解"（"这个订单"=哪个）与"对抗超长对话截断"。**权威永远是本轮工具实时结果，工作记忆只是线索、可能过时**——绝不以它为准。demo 规模下短期记忆已能兜底指代消解，工作记忆可有可无（`memory_enabled` 可整体关）。
+
+### 10.3 长期记忆：三子模块 + 双写 + 语义检索
+
+**存储**：
+- 画像 `profiles` 表（一人一行）、事实 `facts` 表（`(customer_id,key)` 唯一，带 source/confidence/updated_at）、历史 `episodes` 表 + **Milvus 向量**（双写）。
+- 均走现有 async SQLAlchemy 栈；`session_factory=None` 时三子模块回退内存 dict（测试）。
+
+**写入 = 会话结束归档（做法1，见 9.4）**，不是每轮。
+
+**读取（每轮）** `load_context`：
+- 画像 `profile.get` → PG
+- 历史 `episodic.search`：embed(query) → **Milvus 向量检索**（filter customer_id，`consistency_level=Strong` 保证写完即可查）→ 回 PG 载全量 → `MemoryDecay.episodic_relevance = 相似度 × exp(-rate×days_ago)` **时间衰减重排** → top_k。Milvus/embedder 不可达 → 降级 DB 最近 N 条。
+- 事实 `get_facts_scored`：按 `updated_at` 距今天数 `ConfidenceManager.current_confidence` 衰减；`format_fact_for_prompt` 分档标注（≥0.8 直出 / ≥0.4 "可能已变更" / <0.4 "待确认核实"）。
+- 工作记忆 `working.get`（见 9.2）。
+- 四块 → `format_memory_for_prompt` → 拼进 SystemMessage。
+
+**置信度来源**：user_explicit 1.0 > tool_result 0.95 > crm 0.9 > agent_inferred 0.6 > historical 0.5。
+
+### 10.4 归档：复用短期摘要 + facts/profile 增量抽取（做法1）
+
+**背景**：早期实现把整段对话拼起来 `[:6000]` 截断喂 LLM，既有反向截断 bug（切掉最近内容）、又与短期摘要重复劳动。且关键权衡是——**摘要够用于"检索历史"，但会抹掉低频细节（用户随口报的电话/地址），不足以抽精确事实**。故按目标拆分输入：
+
+- **episode 摘要（检索用，可容忍丢细节）**：`on_session_end` 用 `short_term.load` 的 `(最近原文 + 滚动摘要)` 喂 `EPISODE_DIGEST_PROMPT` 生成 {summary,intent,resolution,satisfaction}。省 token、不重复摘要、输入量恒定不随会话增长。
+- **facts/profile（要精确）→ 增量抽取**：
+  - `on_turn_end`（回合末）：`compress_if_needed` 若压缩了一批，立即对**这批原文**用 `FACT_EXTRACT_PROMPT` 抽 facts/profile 落库——趁原文未被摘要抹掉细节前抽取。
+  - `on_session_end`（会话末）：只对**未压缩的尾巴**补抽。
+- **核心不变量**：每条消息事实被抽取**且仅一次**——被压批次(压缩时) ∪ 未压尾巴(会话末)，disjoint。短会话（从没压缩）→ 尾巴=全部，会话末一次抽完。
+- **幂等保证**：`set_fact` 按 `(customer_id,key)` upsert、`profile.update_from_conversation` merge 去重 → 重复调用安全。
+- **成本取舍**：每次压缩 2 次 LLM（摘要 1 + 事实抽取 1），换 ShortTermMemory（摘要）与 MemoryManager（事实）职责解耦。压缩低频（每 ~30 条一次），可接受。
+
+**触发**：
+- 主：`POST /v1/chat/{session_id}/end`（前端主动调）。
+- 兜底：`archive_idle_sessions(idle_minutes=30)` 扫超时会话——**函数已备但未接调度**，生产需 k8s CronJob / APScheduler 定时打内部端点。
+
+### 10.5 优雅降级（贯穿全栈）
+
+| 后端挂 | 降级 |
+|--------|------|
+| Redis | 工作记忆走内存 dict |
+| Milvus / embedding | 历史检索降 DB 最近 N；embedder 回退 pseudo 向量 |
+| LLM | 归档不抽取、短期不压缩，仅保留 LIMIT 加载；不阻断对话 |
+| `session_factory=None` | 长期三子模块回退内存 dict（测试） |
+| `memory_enabled=false` | 退回全内存 MemoryManager（短期 LIMIT 加载仍恒开）|
+
+### 10.6 运维备忘
+
+- **建表**：`init_db` 的 `create_all` **只建不改列**。已存在的 `sessions` 表需手动补 `summary` / `summary_upto_id`（开发库已 `ALTER TABLE`；生产走正式 migration）。新增表（profiles/facts/episodes/error_records）自动建。
+- **docker compose**：agent-core 需配 `MILVUS_HOST` / `EMBEDDING_*` / `MEMORY_ENABLED` 等 env + `depends_on milvus` + 复用 `rag_model_cache` 卷，否则向量检索一直降级。

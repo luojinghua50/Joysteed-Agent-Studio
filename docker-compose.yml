@@ -20,11 +20,31 @@ services:
       # OTLP 出口走 otel-collector（再由 collector 扇出给 Tempo + Langfuse）。
       # collector 内网无需鉴权；到 Langfuse 的 Basic 头由 collector 侧补。
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+      # 记忆三层：工作记忆走 REDIS_URL，长期记忆落 DATABASE_URL，历史走 Milvus 向量检索。
+      - MEMORY_ENABLED=true
+      - MILVUS_HOST=milvus
+      - MILVUS_PORT=19530
+      - MEMORY_COLLECTION=memory_episodes
+      # embedding 本地 fastembed（ONNX，无需 torch/外网；与 agent-rag 同模型/同缓存卷）。
+      - EMBEDDING_PROVIDER=fastembed
+      - EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
+      - EMBEDDING_DIM=512
+      - FASTEMBED_CACHE_PATH=/models/fastembed
+      # 首次从 HF 国内镜像下载 ONNX 模型（容器无 IPv6，huggingface.co 不可达）。
+      - HF_ENDPOINT=https://hf-mirror.com
+      - HF_HOME=/models/huggingface
+      - HUGGINGFACE_HUB_CACHE=/models/huggingface/hub
+      - HF_HUB_DISABLE_XET=1
+    volumes:
+      # 复用 agent-rag 的模型缓存卷，避免重复下载 embedding ONNX 模型。
+      - rag_model_cache:/models
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_started
+      milvus:
+        condition: service_healthy
     restart: unless-stopped
 
   # ===== agent-tools MCP Servers =====

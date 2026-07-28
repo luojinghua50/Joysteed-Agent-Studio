@@ -49,3 +49,15 @@ class ConfidenceManager:
 
     def should_ask_user(self, confidence: float, threshold: float = 0.4) -> bool:
         return confidence < threshold
+
+
+def format_fact_for_prompt(key: str, value: str, confidence: float) -> str:
+    """按置信度分档标注事实，避免 Agent 把低置信度信息当确定事实用。
+
+    ≥0.8 直出；≥0.4 标"可能已变更"；<0.4 标"待确认核实"。
+    """
+    if confidence >= 0.8:
+        return f"- {key}: {value}"
+    if confidence >= 0.4:
+        return f"- {key}: {value}（历史记录，可能已变更）"
+    return f"- {key}: {value}（待确认，请向用户核实）"

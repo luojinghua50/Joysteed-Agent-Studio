@@ -31,6 +31,31 @@ class Settings(BaseSettings):
     # Redis
     redis_url: str = "redis://localhost:6379/0"
 
+    # 记忆管理三层总开关。关闭时退回全内存 MemoryManager（当前行为），不连 Redis/Milvus。
+    # 开启时：工作记忆走 Redis、长期记忆(画像/事实/历史)落 SQLAlchemy、历史走 Milvus 向量检索。
+    # 任一后端不可达均优雅降级（Redis→内存 dict，Milvus/embedding→pseudo/DB 最近 N 条）。
+    memory_enabled: bool = True
+    working_memory_ttl: int = 3600  # 工作记忆 Redis key TTL（秒），会话内实体
+    session_idle_timeout_minutes: int = 30  # 超时归档兜底 job 判定阈值
+
+    # 短期记忆（对话历史）加载与滚动摘要。加载优化恒开（与 memory_enabled 无关）；
+    # 摘要压缩随 llm 有无。load_limit=每轮加载的最近原文上限（安全上界，防全量 SELECT）；
+    # trigger=未压缩消息数超此值触发压缩；keep=压缩后保留的最近原文条数，其余进摘要。
+    short_term_load_limit: int = 30
+    short_term_summary_trigger: int = 30
+    short_term_summary_keep: int = 10
+
+    # 记忆向量检索（Milvus + 本地 embedding），默认值对齐 docker-compose 的 agent-rag。
+    milvus_host: str = "localhost"
+    milvus_port: int = 19530
+    memory_collection: str = "memory_episodes"  # 历史摘要向量 collection
+    embedding_provider: str = "fastembed"  # pseudo / fastembed / openai
+    embedding_model: str = "BAAI/bge-small-zh-v1.5"
+    embedding_dim: int = 512
+    embedding_base_url: str = ""  # provider=openai 时用
+    embedding_api_key: str = ""
+    fastembed_cache_path: str = ""  # 本地 ONNX 模型缓存目录（空则用默认）
+
     # Database
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/agent_core"
     # 审批闸的 LangGraph checkpointer 用 psycopg（≠ SQLAlchemy 的 asyncpg）。留空则由

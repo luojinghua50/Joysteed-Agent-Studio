@@ -165,7 +165,8 @@ def _last_user_msg(state: CustomerState) -> str:
     return ""
 
 
-async def execute_node(state: CustomerState, *, make_llm, mcp, prompts=None, reflection=None) -> dict:
+async def execute_node(state: CustomerState, *, make_llm, mcp, prompts=None,
+                       reflection=None, memory=None) -> dict:
     """审批后落地：批准则执行写工具 + 生成回复；拒绝则取消。
 
     多意图批量栅栏：逐 agent 落地被批准的写、生成回复写入 agent_results（该 agent
@@ -173,6 +174,7 @@ async def execute_node(state: CustomerState, *, make_llm, mcp, prompts=None, ref
     单意图：沿用原路径，清空 pending_write，→ END。
 
     B 路径：apply_refund 执行后的退款确认文案经 _judge_refund_reply 做 L2 仲裁。
+    memory 非空时从写工具结果（apply_refund 的 refund_id/amount 等）抽实体写工作记忆。
     """
     pending = _pending_by_agent(state)
     user_msg = _last_user_msg(state)
@@ -230,6 +232,9 @@ async def execute_node(state: CustomerState, *, make_llm, mcp, prompts=None, ref
     )
     logger.info("approval_executed", agent=agent, tools=[c["name"] for c in executable])
     response = await _judge_refund_reply(reflection, agent, user_msg, results, response)
+    # 工作记忆：从写工具结果（apply_refund 的 refund_id/amount 等）抽实体
+    from src.agents.generic import _write_entities
+    await _write_entities(memory, session_id, results)
     return {
         "messages": [response],
         "resolved": True,
