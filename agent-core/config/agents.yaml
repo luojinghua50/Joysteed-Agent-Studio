@@ -43,5 +43,10 @@ agents:
     tools:
       - server:knowledge
       - tool:create_ticket        # 细粒度：只给建单，不给改单/赔偿
+      # 编排型 skill（只读）：内部封装 order.query_order + knowledge.search_knowledge，
+      # 一次调用完成"查状态+搜方案+给建单建议"。授权 tool:diagnose_fault 等于授权其
+      # 内部工具组合，故 tech_support 经此间接获得 order 的只读能力；写操作仍走上面的
+      # create_ticket（触发审批闸）。
+      - tool:diagnose_fault
     can_handoff_to: [order, complaint]
     reflection: self_check

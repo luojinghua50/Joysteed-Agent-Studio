@@ -1,24 +1,29 @@
+"""Skill server 专用的 MCP client。
+
+复制自 agent-core/src/mcp_client/client.py 并精简：skill_server 是编排型 server，
+自己作为 MCP 客户端去调 leaf server（knowledge/order）。保留原样的 SSE 解析 +
+session 失效(404)重握手自愈逻辑；仅裁掉 skill 用不到的 server（ticket/crm）。
+
+MVP 阶段选择"复制一份"而非抽共享包（见设计决策 1）；跑通后再看是否抽包。
+"""
+import os
+
 import httpx
 import json
 import structlog
-from src.config import Settings
 
 logger = structlog.get_logger()
 
 
-class MCPClientManager:
-    """Manages connections to multiple MCP servers using Streamable HTTP transport."""
+class SkillMCPClient:
+    """Minimal MCP client for skill orchestration — talks to knowledge/order leaf servers."""
 
-    def __init__(self, settings: Settings | None = None):
-        if settings is None:
-            settings = Settings()
-
+    def __init__(self) -> None:
         self.servers = {
-            "knowledge": settings.knowledge_mcp_url,
-            "order": settings.order_mcp_url,
-            "ticket": settings.ticket_mcp_url,
-            "crm": settings.crm_mcp_url,
-            "skill": settings.skill_mcp_url,
+            "knowledge": os.environ.get(
+                "KNOWLEDGE_MCP_URL", "http://localhost:8001/mcp"
+            ),
+            "order": os.environ.get("ORDER_MCP_URL", "http://localhost:8002/mcp"),
         }
         self._http_client: httpx.AsyncClient | None = None
         self._sessions: dict[str, str] = {}
@@ -38,29 +43,12 @@ class MCPClientManager:
         except json.JSONDecodeError:
             return {"error": f"Cannot parse response: {text[:200]}"}
 
-    def _get_headers(self, server: str) -> dict:
-        """Get required headers for MCP Streamable HTTP."""
-        url = self.servers.get(server, "")
-        host = url.split("://")[-1].split("/")[0] if url else "localhost"
-        headers = {
-            "Accept": "application/json, text/event-stream",
-            "Content-Type": "application/json",
-            "Host": host.replace(server.replace("_", "-") + "-mcp", "localhost"),
-        }
-        if server in self._sessions:
-            headers["Mcp-Session-Id"] = self._sessions[server]
-        return headers
-
     async def _ensure_initialized(self, server: str, force: bool = False) -> bool:
-        """Initialize MCP session if not already done.
-
-        force=True 强制重新握手（忽略已有 session）：用于 MCP server 重启后旧
-        session 失效（POST /mcp → 404）的重连自愈，见 call_tool/list_tools 的重试。
-        """
+        """Initialize MCP session if not already done. force=True 强制重握手（404 自愈）。"""
         if server in self._sessions and not force:
             return True
         if force:
-            self._sessions.pop(server, None)  # 丢弃失效 session，下面重新握手
+            self._sessions.pop(server, None)
 
         url = self.servers.get(server)
         if not url:
@@ -80,7 +68,7 @@ class MCPClientManager:
                 "params": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {},
-                    "clientInfo": {"name": "agent-core", "version": "1.0"},
+                    "clientInfo": {"name": "skill-server", "version": "1.0"},
                 },
                 "id": 1,
             }, headers=headers)
@@ -98,20 +86,13 @@ class MCPClientManager:
                 if session_id:
                     self._sessions[server] = session_id
                 return True
-
             return False
         except Exception as e:
             logger.error("mcp_initialize_error", server=server, error=str(e))
             return False
 
     async def _rpc(self, server: str, payload: dict) -> dict:
-        """发送单个 JSON-RPC 请求，遇 404 自动重握手并重试一次。
-
-        404 是 MCP server 重启后旧 session 失效的特征信号（≠406：406 是端点活着
-        但缺 SSE 头）。命中 404 时强制重握手拿新 session 再重试一次；仍失败则抛
-        HTTPStatusError 交由调用方处理。初始化失败（拿不到 session）直接抛
-        ConnectionError。调用方须自行确认 server 已在 self.servers 中。
-        """
+        """发送单个 JSON-RPC 请求，遇 404(session 失效)自动重握手并重试一次。"""
         url = self.servers[server]
         if not await self._ensure_initialized(server):
             raise ConnectionError(f"MCP initialize failed: {server}")
@@ -131,7 +112,6 @@ class MCPClientManager:
 
         response = await client.post(url, json=payload, headers=_headers())
         if response.status_code == 404:
-            # session 失效：强制重握手，用新 session 重试一次
             logger.warning("mcp_session_stale_reconnect", server=server)
             if await self._ensure_initialized(server, force=True):
                 response = await client.post(url, json=payload, headers=_headers())
@@ -139,7 +119,7 @@ class MCPClientManager:
         return self._parse_sse_response(response.text)
 
     async def call_tool(self, server: str, tool_name: str, arguments: dict) -> dict:
-        """Call a tool on a specific MCP server."""
+        """Call a tool on a leaf MCP server. 失败返回 {"error": ...}，不抛。"""
         url = self.servers.get(server)
         if not url:
             return {"error": f"Unknown MCP server: {server}"}
@@ -148,10 +128,7 @@ class MCPClientManager:
             result = await self._rpc(server, {
                 "jsonrpc": "2.0",
                 "method": "tools/call",
-                "params": {
-                    "name": tool_name,
-                    "arguments": arguments,
-                },
+                "params": {"name": tool_name, "arguments": arguments},
                 "id": 2,
             })
 
@@ -178,27 +155,6 @@ class MCPClientManager:
             logger.error("mcp_tool_error", server=server, tool=tool_name, error=str(e))
             return {"error": f"Tool {tool_name} call failed: {str(e)}"}
 
-    async def list_tools(self, server: str) -> list[dict]:
-        """List available tools on a specific MCP server.
-
-        失败即抛：网络错误 / 初始化失败 / 未知 server 都会 raise，由调用方
-        （get_agent_tools）据此区分"MCP 不可达"与"该 server 无工具"，从而决定
-        是否写缓存。切勿把失败吞成 []，否则空结果会被永久缓存、MCP 恢复也不自愈。
-        """
-        if server not in self.servers:
-            raise ValueError(f"Unknown MCP server: {server}")
-
-        # 经 _rpc：含 404 失效 session 的重握手重试；网络/HTTP 错误在此上抛，
-        # 由 get_agent_tools 据此判定"MCP 不可达"从而不缓存空结果。
-        result = await self._rpc(server, {
-            "jsonrpc": "2.0",
-            "method": "tools/list",
-            "params": {},
-            "id": 3,
-        })
-        return result.get("result", {}).get("tools", [])
-
-    async def close(self):
-        """Close the HTTP client."""
+    async def close(self) -> None:
         if self._http_client and not self._http_client.is_closed:
             await self._http_client.aclose()

@@ -13,17 +13,38 @@ services:
       - ORDER_MCP_URL=http://order-mcp:8002/mcp
       - TICKET_MCP_URL=http://ticket-mcp:8003/mcp
       - CRM_MCP_URL=http://crm-mcp:8004/mcp
+      - SKILL_MCP_URL=http://skill-mcp:8005/mcp
       - LANGFUSE_HOST=http://langfuse:3000
       - LANGFUSE_PUBLIC_KEY=pk-lf-agent-studio
       - LANGFUSE_SECRET_KEY=sk-lf-agent-studio
       # OTLP 出口走 otel-collector（再由 collector 扇出给 Tempo + Langfuse）。
       # collector 内网无需鉴权；到 Langfuse 的 Basic 头由 collector 侧补。
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+      # 记忆三层：工作记忆走 REDIS_URL，长期记忆落 DATABASE_URL，历史走 Milvus 向量检索。
+      - MEMORY_ENABLED=true
+      - MILVUS_HOST=milvus
+      - MILVUS_PORT=19530
+      - MEMORY_COLLECTION=memory_episodes
+      # embedding 本地 fastembed（ONNX，无需 torch/外网；与 agent-rag 同模型/同缓存卷）。
+      - EMBEDDING_PROVIDER=fastembed
+      - EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
+      - EMBEDDING_DIM=512
+      - FASTEMBED_CACHE_PATH=/models/fastembed
+      # 首次从 HF 国内镜像下载 ONNX 模型（容器无 IPv6，huggingface.co 不可达）。
+      - HF_ENDPOINT=https://hf-mirror.com
+      - HF_HOME=/models/huggingface
+      - HUGGINGFACE_HUB_CACHE=/models/huggingface/hub
+      - HF_HUB_DISABLE_XET=1
+    volumes:
+      # 复用 agent-rag 的模型缓存卷，避免重复下载 embedding ONNX 模型。
+      - rag_model_cache:/models
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_started
+      milvus:
+        condition: service_healthy
     restart: unless-stopped
 
   # ===== agent-tools MCP Servers =====
@@ -75,6 +96,22 @@ services:
     command: python -m crm_server.server
     ports:
       - "8004:8004"
+    restart: unless-stopped
+
+  # 编排型 skill server：自身作为 MCP 客户端去调 knowledge/order，封装多步业务动作
+  skill-mcp:
+    build:
+      context: ./agent-tools
+      dockerfile: Dockerfile
+    command: python -m skill_server.server
+    ports:
+      - "8005:8005"
+    environment:
+      - KNOWLEDGE_MCP_URL=http://knowledge-mcp:8001/mcp
+      - ORDER_MCP_URL=http://order-mcp:8002/mcp
+    depends_on:
+      - knowledge-mcp
+      - order-mcp
     restart: unless-stopped
 
   # ===== agent-rag =====
@@ -185,6 +222,11 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       # LLM_API_BASE 未设置时默认官方 Anthropic；填中转地址即走中转
       - LLM_API_BASE=${LLM_API_BASE:-https://api.anthropic.com}
+      # Langfuse 上报（litellm 的 success/failure_callback 读这几个环境变量）。
+      # 与 agent-core 指向同一 Langfuse 实例，便于并排对照 fallback 记录。
+      - LANGFUSE_HOST=http://langfuse:3000
+      - LANGFUSE_PUBLIC_KEY=pk-lf-agent-studio
+      - LANGFUSE_SECRET_KEY=sk-lf-agent-studio
     restart: unless-stopped
 
   # ===== Observability =====

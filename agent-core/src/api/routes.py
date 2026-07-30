@@ -30,6 +30,74 @@ REQUEST_COUNT = Counter("agent_core_requests_total", "Total requests", ["method"
 CHAT_LATENCY = Histogram("agent_core_chat_duration_seconds", "Chat request latency")
 
 
+def _build_memory_manager(settings, db_factory):
+    """装配记忆三层。settings.memory_enabled 为真时：工作记忆走 Redis、长期记忆落 DB、
+    历史接 Milvus 向量检索。各后端独立 try 降级（Redis→内存 dict，Milvus/embedding→
+    pseudo/DB 兜底），任一不可达都不阻断启动。为假时退回全内存 MemoryManager。
+
+    返回 (memory_manager, redis_client)——redis_client 供 lifespan 收尾关闭。
+    """
+    from src.memory.long_term.profile import ProfileMemory
+    from src.memory.long_term.semantic import SemanticMemory
+    from src.memory.long_term.episodic import EpisodicMemory
+    from src.memory.short_term import ShortTermMemory
+    from src.agents.graph import create_llm
+
+    # 短期记忆加载优化（带 LIMIT 的历史加载）恒开，与 memory_enabled 无关；摘要压缩随 llm。
+    # llm 复用 model_main：memory_enabled 时归档/摘要共用；关时仅给 short_term 用于摘要。
+    st_llm = create_llm(settings, settings.model_main)
+    short_term = ShortTermMemory(
+        db_factory, llm=st_llm,
+        load_limit=settings.short_term_load_limit,
+        trigger=settings.short_term_summary_trigger,
+        keep=settings.short_term_summary_keep,
+    )
+
+    if not settings.memory_enabled:
+        return MemoryManager(working=WorkingMemory(), short_term=short_term), None
+
+    # 工作记忆：Redis（ping 失败→内存 fallback）
+    redis_client = None
+    try:
+        import redis.asyncio as aioredis
+        redis_client = aioredis.from_url(settings.redis_url, decode_responses=True)
+        # 连通性在首次调用时才真正校验；这里不阻塞启动
+        logger.info("working_memory_redis_configured", url=settings.redis_url.split("@")[-1])
+    except Exception as e:
+        logger.warning("working_memory_redis_unavailable_fallback_memory", error=str(e))
+        redis_client = None
+    working = WorkingMemory(redis_client=redis_client, ttl=settings.working_memory_ttl)
+
+    # 向量栈：Embedder（fastembed，失败自动 pseudo）+ MilvusClient（连不上→None，检索降级 DB）
+    embedder = None
+    milvus_client = None
+    try:
+        from src.memory.embedding import Embedder
+        embedder = Embedder(settings)
+    except Exception as e:
+        logger.warning("embedder_init_failed", error=str(e))
+    try:
+        from pymilvus import MilvusClient
+        milvus_client = MilvusClient(uri=f"http://{settings.milvus_host}:{settings.milvus_port}")
+        logger.info("milvus_configured", host=settings.milvus_host, port=settings.milvus_port)
+    except Exception as e:
+        logger.warning("milvus_unavailable_fallback_db_recent", error=str(e))
+        milvus_client = None
+
+    manager = MemoryManager(
+        working=working,
+        profile=ProfileMemory(session_factory=db_factory),
+        semantic=SemanticMemory(session_factory=db_factory),
+        episodic=EpisodicMemory(
+            session_factory=db_factory, embedder=embedder, milvus_client=milvus_client,
+            collection=settings.memory_collection, dim=settings.embedding_dim,
+        ),
+        llm=st_llm,
+        short_term=short_term,
+    )
+    return manager, redis_client
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     """Create and configure the FastAPI application."""
     if settings is None:
@@ -37,6 +105,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        redis_client = None  # 提前声明，保证 finally 清理不 NameError
         app.state.db_session_factory = await init_db(settings.database_url)
         logger.info("database_initialized", url=settings.database_url.split("@")[-1])
 
@@ -68,8 +137,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         mcp = MCPClientManager(settings)
         app.state.mcp = mcp
 
+        # 记忆三层装配（依赖 db_session_factory，故在 lifespan 内建）：工作记忆 Redis、
+        # 长期记忆 DB、历史 Milvus 向量检索，各后端独立降级。覆盖模块级占位 memory_manager。
+        memory_manager, redis_client = _build_memory_manager(settings, app.state.db_session_factory)
+        app.state.memory_manager = memory_manager
+        app.state.redis_client = redis_client
+
+        # L2 自我反思（judge 仲裁 + 错误记忆持久化）总开关：settings.reflection_enabled
+        # （默认 False，见 Settings 注释）。开启则注入 SqlErrorMemoryStore，图内三节点
+        # 对 complaint/退款高危场景做仲裁；关闭则 error_store=None，行为与接入前逐行一致。
+        error_store = None
+        if settings.reflection_enabled:
+            from src.reflection.error_memory import SqlErrorMemoryStore
+            error_store = SqlErrorMemoryStore(app.state.db_session_factory)
+            logger.info("reflection_enabled")
+        app.state.error_store = error_store
         app.state.graph = compile_graph(settings, memory_manager, prompts=prompts,
-                                        mcp=mcp, checkpointer=checkpointer)
+                                        mcp=mcp, checkpointer=checkpointer,
+                                        error_store=error_store)
 
         # 启动预热：把各 agent 工具清单拉满缓存，冷启动延迟从用户请求路径挪到此处。
         # 绝不阻断启动 —— agent-tools 未就绪时仅记 warning，首次请求再自愈。
@@ -87,6 +172,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 await mcp.close()  # 释放 httpx 连接
             except Exception:
                 pass
+            if redis_client is not None:
+                try:
+                    await redis_client.aclose()  # 释放工作记忆 Redis 连接
+                except Exception:
+                    pass
             if cm is not None:
                 await cm.__aexit__(None, None, None)  # 释放 PG 连接池
 
@@ -125,11 +215,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     except Exception as e:
         logger.warning("prompts_load_failed", error=str(e))
 
-    memory_manager = MemoryManager(working=WorkingMemory())
+    # 模块级占位：真正的 memory_manager 在 lifespan 内用 db_session_factory 装配后覆盖
+    # （见 _build_memory_manager）。此占位保证无 lifespan 的轻量测试仍可用全内存记忆。
     app.state.settings = settings
     app.state.prompts = prompts
     app.state.langfuse_handler = langfuse_handler
-    app.state.memory_manager = memory_manager
+    app.state.memory_manager = MemoryManager(working=WorkingMemory())
     # 注意：app.state.graph 在 lifespan 内编译（依赖 checkpointer 的异步连接池）
 
     from src.api.auth_routes import router as auth_router
@@ -190,28 +281,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     db.add(user_msg)
                     await db.commit()
 
-                    stmt = select(MessageModel).where(
-                        MessageModel.session_id == session_id
-                    ).order_by(MessageModel.timestamp)
-                    result = await db.execute(stmt)
-                    all_msgs = result.scalars().all()
-
-                history_messages = []
-                for msg in all_msgs:
-                    if msg.role == "user":
-                        history_messages.append(HumanMessage(content=msg.content))
-                    elif msg.role == "assistant":
-                        history_messages.append(AIMessage(content=msg.content))
+                # 短期记忆加载：ShortTermMemory 带 LIMIT 只取最近原文 + 滚动摘要；
+                # 无 short_term（轻量测试/未装配）时回退原全量 SELECT，保证行为不破。
+                st = getattr(app.state.memory_manager, "short_term", None)
+                summary_text = ""
+                if st is not None:
+                    history_messages, summary_text = await st.load(session_id)
+                else:
+                    async with db_factory() as db:
+                        all_msgs = (await db.execute(
+                            select(MessageModel).where(MessageModel.session_id == session_id)
+                            .order_by(MessageModel.timestamp)
+                        )).scalars().all()
+                    history_messages = [
+                        HumanMessage(content=m.content) if m.role == "user"
+                        else AIMessage(content=m.content)
+                        for m in all_msgs if m.role in ("user", "assistant")
+                    ]
 
                 memory_context = ""
                 try:
-                    mem_data = await memory_manager.load_context(
+                    # 用 lifespan 装配的 memory_manager（DB/Redis/Milvus 后端），非模块级占位
+                    mem_data = await app.state.memory_manager.load_context(
                         customer_id, session_id, request.content
                     )
                     memory_context = format_memory_for_prompt(mem_data)
                     logger.info("memory_loaded", customer_id=customer_id, context_len=len(memory_context))
                 except Exception as e:
                     logger.warning("memory_load_failed", error=str(e))
+
+                # 滚动摘要折进 memory_context（拼进 SystemMessage，永不被历史窗口切掉）
+                if summary_text:
+                    memory_context = f"## 对话历史摘要\n{summary_text}\n\n{memory_context}".rstrip()
 
                 initial_state = {
                     "messages": history_messages,
@@ -253,6 +354,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
                 async for chunk in _emit_result(graph_result, session_id, db_factory):
                     yield chunk
+
+                # 回合结束（非热路径：done 已推给客户端）：触发短期记忆压缩，若有消息被
+                # 压缩则对该批增量抽事实（做法1，趁原文未被摘要抹掉细节前抽取）。
+                # 内部自带 try/except + 无 llm/short_term 降级，绝不影响已返回的响应。
+                await app.state.memory_manager.on_turn_end(customer_id, session_id)
 
             except Exception as e:
                 logger.error("chat_error", error=str(e), session_id=session_id)
@@ -309,6 +415,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+
+    @app.post("/v1/chat/{session_id}/end")
+    async def end_session(session_id: str, customer_id: str = Depends(current_customer)):
+        """显式结束会话并归档到长期记忆（决策 B 的主触发）。
+
+        前端在用户点"结束会话"/关闭窗口/客服结单时调用。载全量消息 → memory_manager
+        .on_session_end（LLM 摘要+事实+画像 → 落长期记忆 + 清工作记忆）。归档尽力而为，
+        单点失败不整体报错。超时未显式结束的会话由 archive_idle_sessions 兜底。
+        """
+        db_factory = app.state.db_session_factory
+        async with db_factory() as db:
+            await _require_session_owner(db, session_id, customer_id)
+            msgs = (await db.execute(
+                select(MessageModel).where(MessageModel.session_id == session_id)
+                .order_by(MessageModel.timestamp)
+            )).scalars().all()
+
+        history = [
+            HumanMessage(content=m.content) if m.role == "user" else AIMessage(content=m.content)
+            for m in msgs
+        ]
+        try:
+            await app.state.memory_manager.on_session_end(customer_id, session_id, history)
+            logger.info("session_archived", session_id=session_id, messages=len(history))
+            return {"status": "archived", "session_id": session_id, "message_count": len(history)}
+        except Exception as e:
+            logger.warning("session_archive_failed", session_id=session_id, error=str(e))
+            return {"status": "error", "session_id": session_id, "detail": str(e)}
 
     @app.get("/v1/chat/{session_id}/history", response_model=ChatHistoryResponse)
     async def get_history(session_id: str, customer_id: str = Depends(current_customer)):

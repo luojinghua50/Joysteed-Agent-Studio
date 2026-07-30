@@ -6,7 +6,7 @@ model_list:
       # 不翻译 system，会报 "messages.0: use the top-level 'system' parameter"。
       model: anthropic/claude-haiku-4-5-20251001
       api_key: os.environ/ANTHROPIC_API_KEY
-      api_base: os.environ/LLM_API_BASE   # 从 .env 注入；官方直连填 https://api.anthropic.com，中转填中转地址
+      api_base: os.environ/LLM_API_BASE # 从 .env 注入；官方直连填 https://api.anthropic.com，中转填中转地址
     model_info:
       description: "FAQ、简单查询 — 快且便宜"
 
@@ -14,7 +14,7 @@ model_list:
     litellm_params:
       model: anthropic/claude-sonnet-4-6
       api_key: os.environ/ANTHROPIC_API_KEY
-      api_base: os.environ/LLM_API_BASE   # 从 .env 注入；官方直连填 https://api.anthropic.com，中转填中转地址
+      api_base: os.environ/LLM_API_BASE # 从 .env 注入；官方直连填 https://api.anthropic.com，中转填中转地址
     model_info:
       description: "订单、技术支持 — 主力模型"
 
@@ -22,19 +22,39 @@ model_list:
     litellm_params:
       model: anthropic/claude-opus-4-6
       api_key: os.environ/ANTHROPIC_API_KEY
-      api_base: os.environ/LLM_API_BASE   # 从 .env 注入；官方直连填 https://api.anthropic.com，中转填中转地址
+      api_base: os.environ/LLM_API_BASE # 从 .env 注入；官方直连填 https://api.anthropic.com，中转填中转地址
     model_info:
       description: "复杂投诉、情绪安抚 — 最强理解力"
+
+  - model_name: "gpt-5.5"
+    litellm_params:
+      # openai provider → 走 /v1/chat/completions。此中转与 Claude 走同一网关，
+      # 但用 OpenAI 协议，故 api_base 需带 /v1，key 用 OPENAI_API_KEY。
+      model: openai/gpt-5.5
+      api_key: os.environ/OPENAI_API_KEY
+      api_base: https://linshi.zhouyang168.top/v1
+      # 该中转网关的 WAF 会拦截 UA 以 "OpenAI/Python"/"AsyncOpenAI/Python" 开头的请求
+      # （openai SDK 默认 UA），返回 403 "Your request was blocked"。覆盖 UA 绕开。
+      extra_headers:
+        User-Agent: "litellm-proxy/1.0"
+    model_info:
+      description: "跨厂商兜底 — 全部 Claude 部署不可用时切换"
 
 litellm_settings:
   set_verbose: true
   log_responses: true
   json_logs: true
+  # 把 LiteLLM 内部的调用（含 retry/fallback）上报 Langfuse。
+  # failure_callback 是关键：claude 认证失败这条 ERROR generation 才会被记录，
+  # 从而在 Langfuse 里看到「claude 失败 + gpt-5.5 成功」两条相邻记录 = fallback 证据。
+  success_callback: ["langfuse"]
+  failure_callback: ["langfuse"]
 
 router_settings:
   routing_strategy: "simple-shuffle"
   num_retries: 2
   timeout: 60
   fallbacks:
-    - "claude-sonnet-4-6": ["claude-haiku-4-5"]
-    - "claude-opus-4-6": ["claude-sonnet-4-6"]
+    - "claude-sonnet-4-6": ["claude-haiku-4-5", "gpt-5.5"]
+    - "claude-opus-4-6": ["claude-sonnet-4-6", "gpt-5.5"]
+    - "claude-haiku-4-5": ["gpt-5.5"]

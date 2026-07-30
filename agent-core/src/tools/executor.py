@@ -24,8 +24,13 @@ class ApprovalRequired(Exception):
         super().__init__(f"approval required: {[c['name'] for c in pending_calls]}")
 
 
-async def _run_one_tool(tool_map: dict, tool_call: dict) -> ToolMessage:
-    """执行单个工具调用，包成 ToolMessage（未知/异常都降级为文本结果，不抛）。"""
+async def _run_one_tool(tool_map: dict, tool_call: dict):
+    """执行单个工具调用（未知/异常都降级为文本结果，不抛）。
+
+    返回 (ToolMessage, raw_result)：raw_result 是工具的原始返回（apply_refund 等
+    写工具返回 dict），供 L2 反思做退款确定性模板/准确性评估用；ToolMessage 仍是
+    喂回 LLM 的文本形态。历史调用方只取第一个元素，行为不变。
+    """
     name, args, call_id = tool_call["name"], tool_call["args"], tool_call["id"]
     logger.info("tool_call", tool=name, args=args)
     if name not in tool_map:
@@ -37,7 +42,7 @@ async def _run_one_tool(tool_map: dict, tool_call: dict) -> ToolMessage:
             logger.error("tool_execution_error", tool=name, error=str(e))
             result = f"工具执行失败: {str(e)}"
     logger.info("tool_result", tool=name, result_preview=str(result)[:200])
-    return ToolMessage(content=str(result), tool_call_id=call_id)
+    return ToolMessage(content=str(result), tool_call_id=call_id), result
 
 
 async def execute_pending_writes(
@@ -46,7 +51,8 @@ async def execute_pending_writes(
     working_messages: list,
     pending_calls: list[dict],
     stub_calls: list[dict] | None = None,
-) -> AIMessage:
+    return_results: bool = False,
+):
     """execute 节点用：批准后执行待办写工具，据结果生成最终回复。
 
     working_messages 里的 AIMessage 带着**全部**待办写的 tool_calls，但只有 approved
@@ -56,9 +62,15 @@ async def execute_pending_writes(
 
     末尾的 llm.ainvoke 不绑定工具（bounded：只让它基于工具结果措辞，不再发起新
     工具调用），因此无 replay、无 divergence、LLM 调用次数与正常 loop 一致。
+
+    return_results=True 时额外返回 {tool_name: raw_result} 供 L2 反思（退款模板/
+    准确性评估）；默认 False，历史调用方零影响。
     """
+    results: dict = {}
     for call in pending_calls:
-        working_messages.append(await _run_one_tool(tool_map, call))
+        tool_msg, raw = await _run_one_tool(tool_map, call)
+        working_messages.append(tool_msg)
+        results[call["name"]] = raw
     for call in stub_calls or []:
         working_messages.append(
             ToolMessage(
@@ -66,7 +78,10 @@ async def execute_pending_writes(
                 tool_call_id=call["id"],
             )
         )
-    return await llm.ainvoke(working_messages)
+    response = await llm.ainvoke(working_messages)
+    if return_results:
+        return response, results
+    return response
 
 
 async def run_agent_with_tools(
@@ -76,7 +91,15 @@ async def run_agent_with_tools(
     messages: list,
     max_iterations: int = MAX_TOOL_ITERATIONS,
     protected_tools: set[str] | None = None,
-) -> AIMessage:
+    return_transcript: bool = False,
+):
+    """执行 LLM 工具调用循环，返回最终 AIMessage。
+
+    return_transcript=True 时返回 (response, working_messages, tool_results)：
+    working_messages 是完整对话轨迹（供 L2 bounded 重写复用，不重跑工具），
+    tool_results 是 {tool_name: raw_result}（供 judge 做准确性评估）。默认 False，
+    历史调用方零影响。
+    """
     if tools:
         llm_with_tools = llm.bind_tools(tools)
     else:
@@ -85,6 +108,10 @@ async def run_agent_with_tools(
     protected = protected_tools or set()
     tool_map = {tool.name: tool for tool in tools}
     working_messages = [SystemMessage(content=system_prompt), *messages]
+    tool_results: dict = {}
+
+    def _ret(resp: AIMessage):
+        return (resp, working_messages, tool_results) if return_transcript else resp
 
     logger.info("llm_invoke_start", tool_count=len(tools), message_count=len(messages))
 
@@ -99,7 +126,8 @@ async def run_agent_with_tools(
         )
 
         if not response.tool_calls:
-            return response
+            working_messages.append(response)
+            return _ret(response)
 
         if iteration >= max_iterations:
             logger.warning("tool_loop_max_iterations", iterations=iteration)
@@ -111,7 +139,8 @@ async def run_agent_with_tools(
                 )
             )
             final = await llm.ainvoke(working_messages)
-            return final
+            working_messages.append(final)
+            return _ret(final)
 
         working_messages.append(response)
 
@@ -120,7 +149,9 @@ async def run_agent_with_tools(
         for tool_call in response.tool_calls:
             if tool_call["name"] in protected:
                 continue  # 写工具留给审批闸，绝不在确认前执行
-            working_messages.append(await _run_one_tool(tool_map, tool_call))
+            tool_msg, raw = await _run_one_tool(tool_map, tool_call)
+            working_messages.append(tool_msg)
+            tool_results[tool_call["name"]] = raw
 
         # 有写工具 → 在其落地前中断，交审批闸。working_messages 此刻已含带全部
         # tool_calls 的 AIMessage + 读工具的 ToolMessage；execute 节点补齐写工具
@@ -128,4 +159,4 @@ async def run_agent_with_tools(
         if pending_writes:
             raise ApprovalRequired(pending_calls=pending_writes, working_messages=working_messages)
 
-    return AIMessage(content="抱歉，处理过程中遇到了问题，请稍后再试。")
+    return _ret(AIMessage(content="抱歉，处理过程中遇到了问题，请稍后再试。"))

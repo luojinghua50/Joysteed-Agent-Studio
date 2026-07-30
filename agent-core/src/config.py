@@ -21,8 +21,40 @@ class Settings(BaseSettings):
     # 关闭时行为与改造前完全一致（工具直连执行），故对现有流程零影响、可灰度。
     approval_enabled: bool = True
 
+    # L2 自我反思（judge 仲裁 + 错误记忆持久化）总开关。默认关闭：LLM judge 无
+    # ground truth，抓不到资损类真错，能抓的（泄露/过度承诺）已被 OutputFilter/prompt
+    # 覆盖，成本/延迟不划算。开启后由 SqlErrorMemoryStore 注入图，对 complaint/退款
+    # 高危场景做仲裁（触发范围见 ReflectionConfig.agent_policies/skill_policies）。
+    # 关闭时三节点 reflection=None，行为与接入前逐行一致。
+    reflection_enabled: bool = False
+
     # Redis
     redis_url: str = "redis://localhost:6379/0"
+
+    # 记忆管理三层总开关。关闭时退回全内存 MemoryManager（当前行为），不连 Redis/Milvus。
+    # 开启时：工作记忆走 Redis、长期记忆(画像/事实/历史)落 SQLAlchemy、历史走 Milvus 向量检索。
+    # 任一后端不可达均优雅降级（Redis→内存 dict，Milvus/embedding→pseudo/DB 最近 N 条）。
+    memory_enabled: bool = True
+    working_memory_ttl: int = 3600  # 工作记忆 Redis key TTL（秒），会话内实体
+    session_idle_timeout_minutes: int = 30  # 超时归档兜底 job 判定阈值
+
+    # 短期记忆（对话历史）加载与滚动摘要。加载优化恒开（与 memory_enabled 无关）；
+    # 摘要压缩随 llm 有无。load_limit=每轮加载的最近原文上限（安全上界，防全量 SELECT）；
+    # trigger=未压缩消息数超此值触发压缩；keep=压缩后保留的最近原文条数，其余进摘要。
+    short_term_load_limit: int = 30
+    short_term_summary_trigger: int = 30
+    short_term_summary_keep: int = 10
+
+    # 记忆向量检索（Milvus + 本地 embedding），默认值对齐 docker-compose 的 agent-rag。
+    milvus_host: str = "localhost"
+    milvus_port: int = 19530
+    memory_collection: str = "memory_episodes"  # 历史摘要向量 collection
+    embedding_provider: str = "fastembed"  # pseudo / fastembed / openai
+    embedding_model: str = "BAAI/bge-small-zh-v1.5"
+    embedding_dim: int = 512
+    embedding_base_url: str = ""  # provider=openai 时用
+    embedding_api_key: str = ""
+    fastembed_cache_path: str = ""  # 本地 ONNX 模型缓存目录（空则用默认）
 
     # Database
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/agent_core"
@@ -35,6 +67,7 @@ class Settings(BaseSettings):
     order_mcp_url: str = "http://localhost:8002/mcp"
     ticket_mcp_url: str = "http://localhost:8003/mcp"
     crm_mcp_url: str = "http://localhost:8004/mcp"
+    skill_mcp_url: str = "http://localhost:8005/mcp"  # 编排型 server：封装多步业务动作
 
     # Security
     jwt_secret: str = "dev-secret-key-change-in-production"
