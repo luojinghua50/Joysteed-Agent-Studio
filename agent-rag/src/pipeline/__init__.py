@@ -20,6 +20,11 @@ class SmartSplitter:
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
 
+    @staticmethod
+    def _estimate_token_count(text: str) -> int:
+        """Rough token estimate for storage/display only; char count keeps it dependency-free."""
+        return len(text)
+
     def split(
         self, text: str, file_type: str = "txt", strategy: ChunkingStrategy = ChunkingStrategy.AUTO
     ) -> list[Chunk]:
@@ -34,6 +39,12 @@ class SmartSplitter:
             return self._split_fixed(text)
         elif strategy == ChunkingStrategy.QA_PAIR:
             return self._split_qa(text)
+        elif strategy == ChunkingStrategy.PARENT_CHILD:
+            return self._split_parent_child(text)
+        elif strategy == ChunkingStrategy.TABLE:
+            return self._split_table(text)
+        elif strategy == ChunkingStrategy.SEMANTIC:
+            return self._split_recursive(text)
         else:
             return self._split_recursive(text)
 
@@ -88,7 +99,10 @@ class SmartSplitter:
         for part in parts:
             candidate = current + sep + part if current else part
             if len(candidate) > self.chunk_size and current:
-                chunks.append(self._make_chunk(current.strip(), len(chunks)))
+                if len(current) > self.chunk_size and remaining_seps:
+                    chunks.extend(self._recursive_split(current, remaining_seps))
+                else:
+                    chunks.append(self._make_chunk(current.strip(), len(chunks)))
                 current = part
             else:
                 current = candidate
@@ -126,13 +140,83 @@ class SmartSplitter:
             return self._split_recursive(text)
         return chunks
 
-    def _make_chunk(self, text: str, index: int, header: str = "") -> Chunk:
+    def _split_table(self, text: str) -> list[Chunk]:
+        """Split CSV/TSV into one chunk per data row, each prefixed with the header.
+
+        Header line = first non-empty row. Every data row becomes its own chunk so
+        retrieval returns exactly one record rather than a mixed multi-row blob.
+        When a single row already exceeds chunk_size (e.g. very wide tables), it is
+        still emitted as one chunk — splitting mid-row would destroy the record.
+        """
+        rows = [r for r in text.splitlines() if r.strip()]
+        if not rows:
+            return []
+
+        header = rows[0]
+        data_rows = rows[1:]
+
+        if not data_rows:
+            # Header-only file — return as a single chunk
+            return [self._make_chunk(header, 0)]
+
+        chunks = []
+        for row in data_rows:
+            chunk_text = f"{header}\n{row}"
+            chunks.append(self._make_chunk(chunk_text, len(chunks)))
+        return chunks
+
+    def _split_parent_child(self, text: str) -> list[Chunk]:
+        """Index child chunks while preserving parent section text for recall context."""
+        sections = self._heading_sections(text)
+        if not sections:
+            sections = [("", text)]
+
+        chunks: list[Chunk] = []
+        for parent_index, (header, body) in enumerate(sections):
+            parent_text = f"{header}\n\n{body}".strip() if header else body.strip()
+            if not parent_text:
+                continue
+            child_source = body.strip() or parent_text
+            children = self._split_recursive(child_source)
+            for child_index, child in enumerate(children):
+                chunks.append(self._make_chunk(
+                    child.text,
+                    len(chunks),
+                    header,
+                    metadata={
+                        "parent_id": f"parent-{parent_index:04d}",
+                        "parent_index": parent_index,
+                        "child_index": child_index,
+                        "parent_text": parent_text,
+                    },
+                ))
+        return chunks
+
+    def _heading_sections(self, text: str) -> list[tuple[str, str]]:
+        sections = re.split(r'(?:^|\n)(#{1,3}\s+.+)', text)
+        out: list[tuple[str, str]] = []
+        current_header = ""
+        current_text = ""
+        for section in sections:
+            if re.match(r'^#{1,3}\s+', section):
+                if current_text.strip():
+                    out.append((current_header, current_text.strip()))
+                current_header = section.strip()
+                current_text = ""
+            else:
+                current_text += section
+        if current_text.strip():
+            out.append((current_header, current_text.strip()))
+        return out
+
+    def _make_chunk(self, text: str, index: int, header: str = "", metadata: dict | None = None) -> Chunk:
         return Chunk(
             id=f"chunk-{index:04d}",
             doc_id="",
             kb_id="",
             text=text,
             index=index,
+            metadata=metadata or {},
             context_header=header,
-            token_count=len(text),
+            token_count=self._estimate_token_count(text),
         )

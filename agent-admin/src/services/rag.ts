@@ -27,7 +27,17 @@ async function asJson<T>(res: Response): Promise<T> {
 
 // ===== Types =====
 
-export type ChunkingStrategy = 'auto' | 'recursive' | 'heading' | 'fixed' | 'qa_pair';
+export type ChunkingStrategy =
+  | 'auto'
+  | 'recursive'
+  | 'heading'
+  | 'fixed'
+  | 'semantic'
+  | 'table'
+  | 'qa_pair'
+  | 'parent_child';
+
+export type RetrievalMode = 'vector' | 'fulltext' | 'hybrid';
 
 // 知识形态：运营只选形态，后端按形态绑定切片/检索/短路默认配置。
 export type KbForm = 'standard' | 'faq' | 'temporal' | 'multimodal';
@@ -42,12 +52,36 @@ export interface KnowledgeBase {
   chunking_strategy: string;
   chunk_size: number;
   chunk_overlap: number;
+  embedding_model: string;
+  rerank_model: string;
   document_count: number;
-  // 形态及其绑定的检索配置（后端 _kb_dict 暴露）。
   kb_form: KbForm;
-  retrieval_mode: string;
+  retrieval_mode: RetrievalMode;
+  top_k: number;
   priority_weight: number;
-  shortcut_threshold: number; // 仅 faq 库有意义：高置信短路阈值，可经 PATCH 调整。
+  vector_weight: number;
+  keyword_weight: number;
+  score_threshold: number;
+  shortcut_threshold: number;
+  created_at?: string;
+}
+
+export interface KbConfigInput {
+  name?: string;
+  description?: string;
+  kb_form?: KbForm;
+  chunking_strategy?: ChunkingStrategy;
+  chunk_size?: number;
+  chunk_overlap?: number;
+  retrieval_mode?: RetrievalMode;
+  top_k?: number;
+  priority_weight?: number;
+  vector_weight?: number;
+  keyword_weight?: number;
+  score_threshold?: number;
+  shortcut_threshold?: number;
+  embedding_model?: string;
+  rerank_model?: string;
 }
 
 export interface MetadataField {
@@ -113,17 +147,35 @@ export function listKbs(): Promise<KnowledgeBase[]> {
   return fetch(`${BASE}/api/knowledge-bases`, { headers: headers() }).then(asJson<KnowledgeBase[]>);
 }
 
-export function createKb(
-  name: string,
-  description = '',
-  kbForm: KbForm = 'standard',
-  strategy?: ChunkingStrategy,
-): Promise<KnowledgeBase> {
+function appendConfigParams(qs: URLSearchParams, config: KbConfigInput, mode: 'create' | 'update') {
+  if (config.name !== undefined) qs.set('name', config.name);
+  if (config.description !== undefined) qs.set('description', config.description);
+  if (config.kb_form !== undefined) qs.set('kb_form', config.kb_form);
+  if (config.chunking_strategy !== undefined) {
+    qs.set(mode === 'create' ? 'strategy' : 'chunking_strategy', config.chunking_strategy);
+  }
+  if (config.chunk_size !== undefined) qs.set('chunk_size', String(config.chunk_size));
+  if (config.chunk_overlap !== undefined) qs.set('chunk_overlap', String(config.chunk_overlap));
+  if (config.retrieval_mode !== undefined) qs.set('retrieval_mode', config.retrieval_mode);
+  if (config.top_k !== undefined) qs.set('top_k', String(config.top_k));
+  if (config.priority_weight !== undefined) qs.set('priority_weight', String(config.priority_weight));
+  if (config.vector_weight !== undefined) qs.set('vector_weight', String(config.vector_weight));
+  if (config.keyword_weight !== undefined) qs.set('keyword_weight', String(config.keyword_weight));
+  if (config.score_threshold !== undefined) qs.set('score_threshold', String(config.score_threshold));
+  if (config.shortcut_threshold !== undefined) qs.set('shortcut_threshold', String(config.shortcut_threshold));
+  if (config.embedding_model !== undefined) qs.set('embedding_model', config.embedding_model);
+  if (config.rerank_model !== undefined) qs.set('rerank_model', config.rerank_model);
+}
+
+export function createKb(config: KbConfigInput & { name: string }): Promise<KnowledgeBase> {
   // NOTE: agent-rag takes these as QUERY params, not a JSON body. Chinese must
   // be URL-encoded (URLSearchParams handles that) or the server returns 400.
-  // strategy 可选：省略时后端按 kb_form 绑定默认切片策略。
-  const qs = new URLSearchParams({ name, description, kb_form: kbForm });
-  if (strategy) qs.set('strategy', strategy);
+  const qs = new URLSearchParams({
+    name: config.name,
+    description: config.description ?? '',
+    kb_form: config.kb_form ?? 'standard',
+  });
+  appendConfigParams(qs, config, 'create');
   return fetch(`${BASE}/api/knowledge-bases?${qs}`, {
     method: 'POST',
     headers: headers(),
@@ -137,16 +189,20 @@ export function deleteKb(kbId: string): Promise<unknown> {
   }).then(asJson);
 }
 
-// 更新 faq 库的高置信短路阈值。后端取 query 参数、值域 [0,1]、仅 faq 库有效。
-export function updateKbThreshold(
+export function updateKbConfig(
   kbId: string,
-  shortcutThreshold: number,
+  config: KbConfigInput,
 ): Promise<KnowledgeBase> {
-  const qs = new URLSearchParams({ shortcut_threshold: String(shortcutThreshold) });
+  const qs = new URLSearchParams();
+  appendConfigParams(qs, config, 'update');
   return fetch(`${BASE}/api/knowledge-bases/${kbId}?${qs}`, {
     method: 'PATCH',
     headers: headers(),
   }).then(asJson<KnowledgeBase>);
+}
+
+export function updateKbThreshold(kbId: string, shortcutThreshold: number): Promise<KnowledgeBase> {
+  return updateKbConfig(kbId, { shortcut_threshold: shortcutThreshold });
 }
 
 // ===== Documents =====

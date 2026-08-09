@@ -5,7 +5,10 @@ on PostgreSQL (production) and SQLite (tests).
 """
 from datetime import datetime
 
-from sqlalchemy import String, Text, DateTime, Integer, BigInteger, Float, JSON, ForeignKey, func, Index, UniqueConstraint
+from sqlalchemy import (
+    String, Text, DateTime, Integer, BigInteger, Float, JSON, ForeignKey, func, Index,
+    UniqueConstraint, inspect, text,
+)
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -24,16 +27,18 @@ class KnowledgeBaseModel(Base):
     chunking_strategy: Mapped[str] = mapped_column(String(32), default="auto")
     chunk_size: Mapped[int] = mapped_column(Integer, default=512)
     chunk_overlap: Mapped[int] = mapped_column(Integer, default=50)
-    embedding_model: Mapped[str] = mapped_column(String(64), default="text-embedding-3-small")
+    embedding_model: Mapped[str] = mapped_column(String(128), default="BAAI/bge-small-zh-v1.5")
+    rerank_model: Mapped[str] = mapped_column(String(128), default="BAAI/bge-reranker-base")
     document_count: Mapped[int] = mapped_column(Integer, default=0)
     # 知识形态与检索配置（多 collection 方案）
     kb_form: Mapped[str] = mapped_column(String(24), default="standard")  # faq|standard|temporal|multimodal
     collection_name: Mapped[str] = mapped_column(String(64), default="")  # 物理 Milvus collection 名
     retrieval_mode: Mapped[str] = mapped_column(String(16), default="hybrid")  # vector|fulltext|hybrid
+    top_k: Mapped[int] = mapped_column(Integer, default=5)
     priority_weight: Mapped[float] = mapped_column(Float, default=0.7)   # 跨库融合的库级权重
     vector_weight: Mapped[float] = mapped_column(Float, default=0.6)     # 库内 hybrid 向量配比
     keyword_weight: Mapped[float] = mapped_column(Float, default=0.4)    # 库内 hybrid 关键词配比
-    score_threshold: Mapped[float] = mapped_column(Float, default=0.0)
+    score_threshold: Mapped[float] = mapped_column(Float, default=0.0)  # raw score floor before hybrid RRF
     shortcut_threshold: Mapped[float] = mapped_column(Float, default=0.0)  # 仅 faq：高置信短路阈值
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
@@ -90,7 +95,7 @@ class ChunkModel(Base):
     chunk_hash: Mapped[str] = mapped_column(String(64))
     context_header: Mapped[str] = mapped_column(String(512), default="")
     keywords: Mapped[list] = mapped_column(JSON, default=list)
-    token_count: Mapped[int] = mapped_column(Integer, default=0)
+    token_count: Mapped[int] = mapped_column(Integer, default=0)  # rough estimate only; not strict tokenizer output
     meta: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
@@ -120,9 +125,26 @@ class AuditLogModel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
+def _ensure_knowledge_base_columns(conn):
+    """Best-effort lightweight migration for deployments without Alembic."""
+    existing = {c["name"] for c in inspect(conn).get_columns("knowledge_bases")}
+    columns = {
+        "embedding_model": "VARCHAR(128) DEFAULT 'BAAI/bge-small-zh-v1.5'",
+        "rerank_model": "VARCHAR(128) DEFAULT 'BAAI/bge-reranker-base'",
+        "top_k": "INTEGER DEFAULT 5",
+        "vector_weight": "FLOAT DEFAULT 0.6",
+        "keyword_weight": "FLOAT DEFAULT 0.4",
+        "score_threshold": "FLOAT DEFAULT 0.0",
+    }
+    for name, ddl in columns.items():
+        if name not in existing:
+            conn.execute(text(f"ALTER TABLE knowledge_bases ADD COLUMN {name} {ddl}"))
+
+
 async def init_db(database_url: str) -> async_sessionmaker[AsyncSession]:
     """Create engine, ensure tables exist, return session factory."""
     engine = create_async_engine(database_url, echo=False)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_ensure_knowledge_base_columns)
     return async_sessionmaker(engine, expire_on_commit=False)

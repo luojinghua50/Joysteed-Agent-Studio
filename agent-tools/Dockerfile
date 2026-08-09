@@ -12,6 +12,6 @@ COPY ticket_server/ ticket_server/
 COPY crm_server/ crm_server/
 COPY skill_server/ skill_server/
 
-RUN uv pip install --system .
+RUN uv pip install --system --index-url https://pypi.tuna.tsinghua.edu.cn/simple .
 
 CMD ["python", "-m", "knowledge_server.server"]

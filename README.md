@@ -184,6 +184,28 @@ flowchart TB
 
 **一次客户请求的旅程:** 客户在 `agent-web` 提问 → `agent-core` 的 Supervisor 识别意图分派给业务 Agent → Agent 调用 MCP 工具(查订单 / 建工单)并经 `agent-rag` 检索知识 → litellm 选择合适模型生成回复 → 全程 trace 上报可观测平台;若 AI 无法解决,转人工到 `agent-desk` 由坐席接管。
 
+## 📚 知识库管理
+
+`agent-admin` 提供完整的知识库管理后台，覆盖从创建配置到上线验证的全流程。
+
+<div align="center">
+  <img src="docs/images/kb_list.png" alt="知识库列表" width="800" />
+  <br/>
+  <em>知识库列表：集中管理多个知识库，展示文档数量、版本状态与启用情况</em>
+</div>
+
+<div align="center">
+  <img src="docs/images/kb_add.png" alt="新增知识库" width="700" />
+  <br/>
+  <em>新增知识库：配置名称、描述、分块策略与嵌入参数，支持多格式文档上传</em>
+</div>
+
+<div align="center">
+  <img src="docs/images/kb_manage_test.png" alt="知识库管理与检索测试" width="700" />
+  <br/>
+  <em>文档管理与版本发布：上传文档、触发索引构建、发布新版本，并可在线输入查询实时验证检索效果</em>
+</div>
+
 ## 📦 模块一览
 
 | 模块 | 技术栈 | 职责 |

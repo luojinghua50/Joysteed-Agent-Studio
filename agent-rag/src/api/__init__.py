@@ -28,19 +28,65 @@ def _tenant(x_tenant_id: str = Header(default="default")) -> str:
     return x_tenant_id
 
 
+VALID_KB_FORMS = ("faq", "standard", "temporal", "multimodal")
+VALID_RETRIEVAL_MODES = ("vector", "fulltext", "hybrid")
+
+
 def _form_defaults(kb_form: str) -> dict:
-    """知识形态 → 切片/检索默认配置（运营只选形态，不碰内部参数）。"""
+    """知识形态模板 → 默认配置。模板只预填，显式参数可覆盖。"""
     table = {
         "faq":        {"chunking_strategy": "qa_pair", "retrieval_mode": "hybrid",
-                       "priority_weight": 1.0, "shortcut_threshold": 0.70},
+                       "priority_weight": 1.0, "vector_weight": 0.7, "keyword_weight": 0.3,
+                       "score_threshold": 0.0, "shortcut_threshold": 0.70},
         "standard":   {"chunking_strategy": "heading", "retrieval_mode": "hybrid",
-                       "priority_weight": 0.7, "shortcut_threshold": 0.0},
+                       "priority_weight": 0.7, "vector_weight": 0.6, "keyword_weight": 0.4,
+                       "score_threshold": 0.0, "shortcut_threshold": 0.0},
         "temporal":   {"chunking_strategy": "auto", "retrieval_mode": "hybrid",
-                       "priority_weight": 0.5, "shortcut_threshold": 0.0},
+                       "priority_weight": 0.5, "vector_weight": 0.6, "keyword_weight": 0.4,
+                       "score_threshold": 0.0, "shortcut_threshold": 0.0},
         "multimodal": {"chunking_strategy": "auto", "retrieval_mode": "vector",
-                       "priority_weight": 0.3, "shortcut_threshold": 0.0},
+                       "priority_weight": 0.3, "vector_weight": 1.0, "keyword_weight": 0.0,
+                       "score_threshold": 0.0, "shortcut_threshold": 0.0},
     }
     return table.get(kb_form, table["standard"])
+
+
+def _validate_ratio(name: str, value: float):
+    if not 0.0 <= value <= 1.0:
+        raise HTTPException(status_code=400, detail=f"{name} 必须在 [0, 1] 之间")
+
+
+def _validate_chunk_params(chunk_size: int, chunk_overlap: int):
+    if chunk_size < 100 or chunk_size > 4000:
+        raise HTTPException(status_code=400, detail="chunk_size 必须在 [100, 4000] 之间")
+    if chunk_overlap < 0 or chunk_overlap >= chunk_size:
+        raise HTTPException(status_code=400, detail="chunk_overlap 必须 >=0 且小于 chunk_size")
+
+
+def _validate_top_k(top_k: int):
+    if top_k < 1 or top_k > 50:
+        raise HTTPException(status_code=400, detail="top_k 必须在 [1, 50] 之间")
+
+
+def _validate_hybrid_weights(vector_weight: float, keyword_weight: float):
+    if abs((vector_weight + keyword_weight) - 1.0) > 0.001:
+        raise HTTPException(status_code=400, detail="vector_weight + keyword_weight 必须等于 1")
+
+
+def _chunking_value(strategy: str) -> str:
+    try:
+        return ChunkingStrategy(strategy).value
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"invalid chunking_strategy: {strategy}")
+
+
+def _apply_kb_search_config(request: SearchRequest, kb: KnowledgeBaseModel) -> SearchRequest:
+    request.top_k = request.top_k or kb.top_k
+    request.embedding_model = request.embedding_model or kb.embedding_model
+    request.vector_weight = kb.vector_weight
+    request.keyword_weight = kb.keyword_weight
+    request.score_threshold = kb.score_threshold
+    return request
 
 
 def _kb_dict(kb: KnowledgeBaseModel) -> dict:
@@ -48,10 +94,14 @@ def _kb_dict(kb: KnowledgeBaseModel) -> dict:
         "id": kb.id, "tenant_id": kb.tenant_id, "name": kb.name,
         "description": kb.description, "chunking_strategy": kb.chunking_strategy,
         "chunk_size": kb.chunk_size, "chunk_overlap": kb.chunk_overlap,
+        "embedding_model": kb.embedding_model, "rerank_model": kb.rerank_model,
         "document_count": kb.document_count,
         "kb_form": kb.kb_form, "retrieval_mode": kb.retrieval_mode,
-        "priority_weight": kb.priority_weight,
+        "top_k": kb.top_k,
+        "priority_weight": kb.priority_weight, "vector_weight": kb.vector_weight,
+        "keyword_weight": kb.keyword_weight, "score_threshold": kb.score_threshold,
         "shortcut_threshold": kb.shortcut_threshold,
+        "created_at": kb.created_at.isoformat() if kb.created_at else None,
     }
 
 
@@ -180,22 +230,59 @@ def create_app(settings: RAGSettings | None = None) -> FastAPI:
     # ===== Knowledge Base CRUD =====
     @app.post("/api/knowledge-bases")
     async def create_kb(name: str, description: str = "", strategy: str | None = None,
-                        kb_form: str = "standard", tenant_id: str = Depends(_tenant)):
-        """建库：选知识形态(kb_form)即绑定默认切片/检索配置；strategy 可显式覆盖。"""
-        if kb_form not in ("faq", "standard", "temporal", "multimodal"):
+                        kb_form: str = "standard", chunk_size: int | None = None,
+                        chunk_overlap: int | None = None, retrieval_mode: str | None = None,
+                        top_k: int | None = None,
+                        priority_weight: float | None = None, vector_weight: float | None = None,
+                        keyword_weight: float | None = None, score_threshold: float | None = None,
+                        shortcut_threshold: float | None = None, embedding_model: str | None = None,
+                        rerank_model: str | None = None, tenant_id: str = Depends(_tenant)):
+        """建库：模板预填默认值，显式参数覆盖，最终配置落库。"""
+        if kb_form not in VALID_KB_FORMS:
             raise HTTPException(status_code=400, detail=f"invalid kb_form: {kb_form}")
         defaults = _form_defaults(kb_form)
-        chunking = ChunkingStrategy(strategy).value if strategy else defaults["chunking_strategy"]
+        chunking = _chunking_value(strategy) if strategy else defaults["chunking_strategy"]
+        final_chunk_size = chunk_size if chunk_size is not None else settings.default_chunk_size
+        final_chunk_overlap = chunk_overlap if chunk_overlap is not None else settings.default_chunk_overlap
+        _validate_chunk_params(final_chunk_size, final_chunk_overlap)
+        final_top_k = top_k if top_k is not None else 5
+        _validate_top_k(final_top_k)
+        final_retrieval_mode = retrieval_mode or defaults["retrieval_mode"]
+        if final_retrieval_mode not in VALID_RETRIEVAL_MODES:
+            raise HTTPException(status_code=400, detail=f"invalid retrieval_mode: {final_retrieval_mode}")
+        final_priority_weight = defaults["priority_weight"] if priority_weight is None else priority_weight
+        final_vector_weight = defaults["vector_weight"] if vector_weight is None else vector_weight
+        final_keyword_weight = defaults["keyword_weight"] if keyword_weight is None else keyword_weight
+        final_score_threshold = defaults["score_threshold"] if score_threshold is None else score_threshold
+        final_shortcut_threshold = (
+            defaults["shortcut_threshold"] if shortcut_threshold is None else shortcut_threshold
+        )
+        for field, value in (
+            ("priority_weight", final_priority_weight),
+            ("vector_weight", final_vector_weight),
+            ("keyword_weight", final_keyword_weight),
+            ("score_threshold", final_score_threshold),
+            ("shortcut_threshold", final_shortcut_threshold),
+        ):
+            _validate_ratio(field, value)
+        _validate_hybrid_weights(final_vector_weight, final_keyword_weight)
         kb_id = short_id()
         async with db_factory() as db:
             kb = KnowledgeBaseModel(
                 id=kb_id, tenant_id=tenant_id, name=name, description=description,
-                chunking_strategy=chunking,
+                chunking_strategy=chunking, chunk_size=final_chunk_size,
+                chunk_overlap=final_chunk_overlap,
+                embedding_model=embedding_model or settings.embedding_model,
+                rerank_model=rerank_model or settings.rerank_model,
                 kb_form=kb_form,
                 collection_name=f"kb_{kb_id}",
-                retrieval_mode=defaults["retrieval_mode"],
-                priority_weight=defaults["priority_weight"],
-                shortcut_threshold=defaults["shortcut_threshold"],
+                retrieval_mode=final_retrieval_mode,
+                top_k=final_top_k,
+                priority_weight=final_priority_weight,
+                vector_weight=final_vector_weight,
+                keyword_weight=final_keyword_weight,
+                score_threshold=final_score_threshold,
+                shortcut_threshold=final_shortcut_threshold,
             )
             db.add(kb)
             await db.commit()
@@ -216,26 +303,73 @@ def create_app(settings: RAGSettings | None = None) -> FastAPI:
             return _kb_dict(kb)
 
     @app.patch("/api/knowledge-bases/{kb_id}")
-    async def update_kb(kb_id: str, shortcut_threshold: float | None = None,
+    async def update_kb(kb_id: str, name: str | None = None, description: str | None = None,
+                        kb_form: str | None = None, chunking_strategy: str | None = None,
+                        chunk_size: int | None = None, chunk_overlap: int | None = None,
+                        retrieval_mode: str | None = None, top_k: int | None = None,
+                        priority_weight: float | None = None,
+                        vector_weight: float | None = None, keyword_weight: float | None = None,
+                        score_threshold: float | None = None, shortcut_threshold: float | None = None,
+                        embedding_model: str | None = None, rerank_model: str | None = None,
                         tenant_id: str = Depends(_tenant)):
-        """更新库的可调参数。目前仅开放 faq 库的 shortcut_threshold(高置信短路阈值)。
+        """更新知识库配置。
 
-        阈值是把危险旋钮：过低则误短路答错，过高则永不短路。仅 faq 库可改、
-        值域 [0,1]、改动写审计。换 embedding 模型后需据真实校准重设此值。
+        检索参数可热更新；chunking_strategy/chunk_size/chunk_overlap/embedding_model
+        影响后续新版本构建，已有文档需重新上传/重建索引后才完全生效。
         """
-        if shortcut_threshold is None:
+        if all(v is None for v in (
+            name, description, kb_form, chunking_strategy, chunk_size, chunk_overlap,
+            retrieval_mode, top_k, priority_weight, vector_weight, keyword_weight,
+            score_threshold, shortcut_threshold,
+            embedding_model, rerank_model,
+        )):
             raise HTTPException(status_code=400, detail="无可更新字段")
-        if not 0.0 <= shortcut_threshold <= 1.0:
-            raise HTTPException(status_code=400, detail="shortcut_threshold 必须在 [0, 1] 之间")
         async with db_factory() as db:
             kb = await _require_kb(db, kb_id, tenant_id)
-            if kb.kb_form != "faq":
-                raise HTTPException(status_code=400,
-                                    detail="shortcut_threshold 仅对 faq 库有效")
-            old = kb.shortcut_threshold
-            kb.shortcut_threshold = shortcut_threshold
-            await _audit(db, tenant_id, "admin", "update_threshold", "knowledge_base", kb.id,
-                         {"from": old, "to": shortcut_threshold})
+            before = _kb_dict(kb)
+            if name is not None:
+                next_name = name.strip()
+                if not next_name:
+                    raise HTTPException(status_code=400, detail="name cannot be empty")
+                kb.name = next_name
+            if description is not None:
+                kb.description = description
+            if kb_form is not None:
+                if kb_form not in VALID_KB_FORMS:
+                    raise HTTPException(status_code=400, detail=f"invalid kb_form: {kb_form}")
+                kb.kb_form = kb_form
+            if chunking_strategy is not None:
+                kb.chunking_strategy = _chunking_value(chunking_strategy)
+            next_chunk_size = kb.chunk_size if chunk_size is None else chunk_size
+            next_chunk_overlap = kb.chunk_overlap if chunk_overlap is None else chunk_overlap
+            if chunk_size is not None or chunk_overlap is not None:
+                _validate_chunk_params(next_chunk_size, next_chunk_overlap)
+                kb.chunk_size = next_chunk_size
+                kb.chunk_overlap = next_chunk_overlap
+            if retrieval_mode is not None:
+                if retrieval_mode not in VALID_RETRIEVAL_MODES:
+                    raise HTTPException(status_code=400, detail=f"invalid retrieval_mode: {retrieval_mode}")
+                kb.retrieval_mode = retrieval_mode
+            if top_k is not None:
+                _validate_top_k(top_k)
+                kb.top_k = top_k
+            for field, value in (
+                ("priority_weight", priority_weight),
+                ("vector_weight", vector_weight),
+                ("keyword_weight", keyword_weight),
+                ("score_threshold", score_threshold),
+                ("shortcut_threshold", shortcut_threshold),
+            ):
+                if value is not None:
+                    _validate_ratio(field, value)
+                    setattr(kb, field, value)
+            if embedding_model is not None:
+                kb.embedding_model = embedding_model.strip()
+            if rerank_model is not None:
+                kb.rerank_model = rerank_model.strip()
+            _validate_hybrid_weights(kb.vector_weight, kb.keyword_weight)
+            await _audit(db, tenant_id, "admin", "update_kb_config", "knowledge_base", kb.id,
+                         {"from": before, "to": _kb_dict(kb)})
             await db.commit()
             await db.refresh(kb)
             return _kb_dict(kb)
@@ -338,7 +472,8 @@ def create_app(settings: RAGSettings | None = None) -> FastAPI:
                 await db.commit()
 
             ver = await app.state.vm.add_version(
-                db, kb, doc, content, filename, file_type, app.state.splitter,
+                db, kb, doc, content, filename, file_type,
+                SmartSplitter(chunk_size=kb.chunk_size, chunk_overlap=kb.chunk_overlap),
             )
 
             if is_new_doc:
@@ -423,6 +558,8 @@ def create_app(settings: RAGSettings | None = None) -> FastAPI:
             visible = await visible_version_ids(db, request.kb_id)
             field_defs = await _kb_field_defs(db, request.kb_id)
         # temporal 库：自动注入有效期过滤（仅当库定义了对应时间字段时）
+        request = _apply_kb_search_config(request, kb)
+        _validate_top_k(request.top_k)
         request.filters = apply_temporal_filters(kb.kb_form, field_defs, request.filters)
         results = await app.state.retriever.search(
             request, visible_version_ids=visible, kb_mode=kb.retrieval_mode,
@@ -451,11 +588,19 @@ def create_app(settings: RAGSettings | None = None) -> FastAPI:
                 plans.append(KbPlan(
                     kb_id=kb.id, kb_form=kb.kb_form,
                     retrieval_mode=kb.retrieval_mode,
+                    top_k=kb.top_k,
                     priority_weight=kb.priority_weight,
+                    embedding_model=kb.embedding_model,
+                    rerank_model=kb.rerank_model,
+                    vector_weight=kb.vector_weight,
+                    keyword_weight=kb.keyword_weight,
+                    score_threshold=kb.score_threshold,
                     shortcut_threshold=kb.shortcut_threshold,
                     visible_version_ids=visible,
                     field_defs=await _kb_field_defs(db, kb.id),
                 ))
+        if request.top_k is not None:
+            _validate_top_k(request.top_k)
         return await app.state.router.route(
             request.query, plans, top_k=request.top_k, base_filters=request.filters,
         )

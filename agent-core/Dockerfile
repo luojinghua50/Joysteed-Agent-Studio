@@ -8,7 +8,7 @@ WORKDIR /app
 # 改 src/ 下的业务代码不会触发依赖重装（原先 COPY src/ 在 install 之前，任何
 # 代码改动都会让下面的 install 层失效 → 每次都重装全量依赖，构建慢的根因）。
 COPY pyproject.toml .
-RUN uv pip install --system -r pyproject.toml
+RUN uv pip install --system --index-url https://pypi.tuna.tsinghua.edu.cn/simple -r pyproject.toml
 
 # 源码/配置层：改这些只会让这之后的层失效，依赖层仍复用缓存。
 # 运行时以 WORKDIR 下的 src/ 导入 src.main:app，无需把项目装成包。

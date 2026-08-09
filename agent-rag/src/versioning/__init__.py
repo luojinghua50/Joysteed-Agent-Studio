@@ -15,6 +15,7 @@ from sqlalchemy import select, func
 from src.db import (
     KnowledgeBaseModel, DocumentModel, DocumentVersionModel, ChunkModel, AuditLogModel,
 )
+from src.extraction import extract_text
 
 logger = structlog.get_logger()
 
@@ -87,51 +88,65 @@ class VersionManager:
         vid = version_id()
 
         minio_key = self.store.build_key(doc.tenant_id, kb.id, doc.id, ver_no, filename)
-        await self.store.put(minio_key, content, content_type="application/octet-stream")
+        cleanup_minio = False
 
-        # shadow version row — invisible to search (current pointer not moved)
-        ver = DocumentVersionModel(
-            id=vid, tenant_id=doc.tenant_id, doc_id=doc.id, kb_id=kb.id,
-            version_no=ver_no, file_hash=file_hash, file_type=file_type,
-            file_size=len(content), minio_key=minio_key, status="processing",
-            heartbeat_at=_utcnow(),
-        )
-        db.add(ver)
-        await db.commit()
-
-        # build: chunk → persist chunks → index
         try:
-            text = content.decode("utf-8", errors="ignore")
-            chunks = splitter.split(text, file_type, kb.chunking_strategy)
-            # 文档级元数据（category/effective_ts...）下沉到每个 chunk，供库内过滤
-            doc_meta = dict(doc.doc_metadata or {})
-            chunk_dicts = []
-            for i, ch in enumerate(chunks):
-                cid = f"{vid}-{i:04d}"
-                # chunk 自身 metadata 优先，文档级补位
-                merged_meta = {**doc_meta, **(ch.metadata or {})}
-                db.add(ChunkModel(
-                    id=cid, tenant_id=doc.tenant_id, version_id=vid, doc_id=doc.id,
-                    kb_id=kb.id, chunk_index=i, text=ch.text,
-                    chunk_hash=sha256(ch.text.encode("utf-8")),
-                    context_header=ch.context_header, keywords=ch.keywords,
-                    token_count=ch.token_count, meta=merged_meta,
-                ))
-                chunk_dicts.append({
-                    "id": cid, "version_id": vid, "doc_id": doc.id, "kb_id": kb.id,
-                    "text": ch.text, "keywords": ch.keywords,
-                    "context_header": ch.context_header, "metadata": merged_meta,
-                })
-            await self.retriever.index_chunks(kb.id, chunk_dicts)
-            ver.chunk_count = len(chunks)
-            ver.status = "ready"
-            ver.completed_at = _utcnow()
+            await self.store.put(minio_key, content, content_type="application/octet-stream")
+            cleanup_minio = True
+
+            # shadow version row — invisible to search (current pointer not moved)
+            ver = DocumentVersionModel(
+                id=vid, tenant_id=doc.tenant_id, doc_id=doc.id, kb_id=kb.id,
+                version_no=ver_no, file_hash=file_hash, file_type=file_type,
+                file_size=len(content), minio_key=minio_key, status="processing",
+                heartbeat_at=_utcnow(),
+            )
+            db.add(ver)
             await db.commit()
-        except Exception as e:
-            ver.status = "failed"
-            ver.error = str(e)
-            await db.commit()
-            logger.error("version_build_failed", doc_id=doc.id, version_id=vid, error=str(e))
+
+            # build: chunk → persist chunks → index
+            try:
+                text = extract_text(content, file_type)
+                chunks = splitter.split(text, file_type, kb.chunking_strategy)
+                # 文档级元数据（category/effective_ts...）下沉到每个 chunk，供库内过滤
+                doc_meta = dict(doc.doc_metadata or {})
+                chunk_dicts = []
+                for i, ch in enumerate(chunks):
+                    cid = f"{vid}-{i:04d}"
+                    # chunk 自身 metadata 优先，文档级补位
+                    merged_meta = {**doc_meta, **(ch.metadata or {})}
+                    db.add(ChunkModel(
+                        id=cid, tenant_id=doc.tenant_id, version_id=vid, doc_id=doc.id,
+                        kb_id=kb.id, chunk_index=i, text=ch.text,
+                        chunk_hash=sha256(ch.text.encode("utf-8")),
+                        context_header=ch.context_header, keywords=ch.keywords,
+                        token_count=ch.token_count, meta=merged_meta,
+                    ))
+                    chunk_dicts.append({
+                        "id": cid, "version_id": vid, "doc_id": doc.id, "kb_id": kb.id,
+                        "text": ch.text, "keywords": ch.keywords,
+                        "context_header": ch.context_header, "metadata": merged_meta,
+                    })
+                await self.retriever.index_chunks(kb.id, chunk_dicts, embedding_model=kb.embedding_model)
+                ver.chunk_count = len(chunks)
+                ver.status = "ready"
+                ver.completed_at = _utcnow()
+                await db.commit()
+            except Exception as e:
+                ver.status = "failed"
+                ver.error = str(e)
+                await db.commit()
+                logger.error("version_build_failed", doc_id=doc.id, version_id=vid, error=str(e))
+                raise
+
+            # Build/index completed successfully; keep the uploaded source object.
+            cleanup_minio = False
+        except Exception:
+            if cleanup_minio:
+                try:
+                    await self.store.delete_prefix(minio_key)
+                except Exception as cleanup_error:
+                    logger.warning("minio_cleanup_failed", minio_key=minio_key, error=str(cleanup_error))
             raise
 
         await self.activate(db, doc, vid, actor=actor)

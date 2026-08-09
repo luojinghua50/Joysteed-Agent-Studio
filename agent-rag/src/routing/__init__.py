@@ -1,7 +1,7 @@
 """检索路由层：跨多库聚合检索（Agent 主用入口）。
 
 单库 /api/search 仍保留供调试。生产链路走 /api/route-search：
-  1. faq 短路：命中高置信 FAQ 直接返回单一答案，跳过融合
+  1. faq 先探针：命中高置信 FAQ 直接返回单一答案，跳过全量检索
   2. 多路并行：对参与的每个库并发检索（各库用自己的 retrieval_mode）
   3. 跨库加权 RRF：按库级 priority_weight 融合多库结果
 
@@ -48,7 +48,13 @@ class KbPlan:
     kb_id: str
     kb_form: str = "standard"
     retrieval_mode: str = "hybrid"
+    top_k: int = 5
     priority_weight: float = 0.7
+    embedding_model: str | None = None
+    rerank_model: str | None = None
+    vector_weight: float = 0.6
+    keyword_weight: float = 0.4
+    score_threshold: float = 0.0
     shortcut_threshold: float = 0.0
     visible_version_ids: list[str] = field(default_factory=list)
     field_defs: dict = field(default_factory=dict)
@@ -63,7 +69,12 @@ class SearchRouter:
 
     async def _search_one(self, plan: KbPlan, query: str, top_k: int, base_filters: list):
         filters = apply_temporal_filters(plan.kb_form, plan.field_defs, base_filters)
-        req = SearchRequest(query=query, kb_id=plan.kb_id, top_k=top_k, filters=filters)
+        req = SearchRequest(
+            query=query, kb_id=plan.kb_id, top_k=top_k, filters=filters,
+            embedding_model=plan.embedding_model,
+            vector_weight=plan.vector_weight, keyword_weight=plan.keyword_weight,
+            score_threshold=plan.score_threshold,
+        )
         return await self.retriever.search(
             req, visible_version_ids=plan.visible_version_ids, kb_mode=plan.retrieval_mode,
         )
@@ -76,33 +87,47 @@ class SearchRouter:
         （经校准：精确问法 ~0.72，同义 ~0.66，无关 ~0.37），阈值才有意义。
         """
         filters = apply_temporal_filters(plan.kb_form, plan.field_defs, base_filters)
-        req = SearchRequest(query=query, kb_id=plan.kb_id, top_k=1, filters=filters)
+        req = SearchRequest(
+            query=query, kb_id=plan.kb_id, top_k=1, filters=filters,
+            embedding_model=plan.embedding_model,
+        )
         res = await self.retriever.search(
             req, visible_version_ids=plan.visible_version_ids, kb_mode="vector",
         )
         return res[0].score if res else 0.0
 
-    async def route(self, query: str, plans: list[KbPlan], top_k: int = 5,
+    async def _faq_shortcut_plan(self, plans: list[KbPlan], query: str, base_filters: list) -> KbPlan | None:
+        faq_plans = [p for p in plans if p.kb_form == FAQ_FORM and p.shortcut_threshold > 0]
+        if not faq_plans:
+            return None
+        probes = await asyncio.gather(
+            *[self._vector_probe_score(p, query, base_filters) for p in faq_plans]
+        )
+        for plan, probe in zip(faq_plans, probes):
+            if probe >= plan.shortcut_threshold:
+                return plan
+        return None
+
+    async def route(self, query: str, plans: list[KbPlan], top_k: int | None = None,
                     base_filters: list | None = None) -> RouteSearchResponse:
         base_filters = base_filters or []
         if not plans:
             return RouteSearchResponse(query=query, results=[], total=0)
+        final_top_k = top_k or max((p.top_k for p in plans), default=5)
+
+        shortcut_plan = await self._faq_shortcut_plan(plans, query, base_filters)
+        if shortcut_plan is not None:
+            out = await self._search_one(shortcut_plan, query, final_top_k, base_filters)
+            out = out[:final_top_k]
+            return RouteSearchResponse(
+                query=query, results=out, total=len(out),
+                shortcut=True, routed_kbs=[shortcut_plan.kb_id],
+            )
 
         # 多路并行：每库各自检索（含 temporal 自动过滤）
         searches = await asyncio.gather(
-            *[self._search_one(p, query, top_k, base_filters) for p in plans]
+            *[self._search_one(p, query, final_top_k, base_filters) for p in plans]
         )
-
-        # faq 短路：用 vector 探针的语义相似度（非 RRF 分）判高置信命中，命中即直答
-        for plan, res in zip(plans, searches):
-            if plan.kb_form == FAQ_FORM and plan.shortcut_threshold > 0 and res:
-                probe = await self._vector_probe_score(plan, query, base_filters)
-                if probe >= plan.shortcut_threshold:
-                    out = res[:top_k]
-                    return RouteSearchResponse(
-                        query=query, results=out, total=len(out),
-                        shortcut=True, routed_kbs=[plan.kb_id],
-                    )
 
         # 跨库加权 RRF：库级 priority_weight 作为各路权重（粗排，决定候选入围）
         weights = [p.priority_weight for p in plans]
@@ -113,11 +138,23 @@ class SearchRouter:
         # reranker 缺省/禁用/异常时退回 RRF 顺序（reranked=False），不阻断检索。
         reranked = False
         if self.reranker is not None and self.reranker.enabled:
+            import inspect
+
             candidate_n = getattr(self.reranker.settings, "rerank_candidate_n", 20)
             candidates = fused[:candidate_n]
-            out, reranked = await self.reranker.rerank(query, candidates, top_k)
+            plan_by_kb = {p.kb_id: p for p in plans}
+            rerank_model = None
+            if candidates:
+                candidate_plan = plan_by_kb.get(candidates[0].kb_id)
+                rerank_model = candidate_plan.rerank_model if candidate_plan else None
+            if "model_name" in inspect.signature(self.reranker.rerank).parameters:
+                out, reranked = await self.reranker.rerank(
+                    query, candidates, final_top_k, model_name=rerank_model,
+                )
+            else:
+                out, reranked = await self.reranker.rerank(query, candidates, final_top_k)
         else:
-            out = fused[:top_k]
+            out = fused[:final_top_k]
 
         return RouteSearchResponse(
             query=query, results=out, total=len(out),
