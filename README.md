@@ -189,7 +189,7 @@ flowchart TB
 `agent-admin` 提供完整的知识库管理后台，覆盖从创建配置到上线验证的全流程。
 
 <div align="center">
-  <img src="docs/images/kb_list.png" alt="知识库列表" width="800" />
+  <img src="docs/images/kb_list.png" alt="知识库列表" width="700" />
   <br/>
   <em>知识库列表：集中管理多个知识库，展示文档数量、版本状态与启用情况</em>
 </div>
