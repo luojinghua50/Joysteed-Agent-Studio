@@ -55,7 +55,6 @@ tmp/
 # ===== 私有文档（留个人查看修改，不开源）=====
 docs/private/
 docs/file/
-docs/images/
 
 # ===== 编辑器 / 系统 =====
 .DS_Store
