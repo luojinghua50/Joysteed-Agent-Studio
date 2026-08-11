@@ -80,14 +80,25 @@ export function SearchTester({ kbId, defaultTopK = 5 }: SearchTesterProps) {
                 }}
               >
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
-                  <span style={{ ...s.muted, fontSize: 12 }}>
-                    #{i + 1} · doc {r.doc_id || '—'}
-                  </span>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span style={{ ...s.muted, fontSize: 12 }}>
+                      #{i + 1} · doc {r.doc_id || '—'}
+                    </span>
+                    {r.metadata?.page != null && (
+                      <span style={{ ...s.pill, background: tokens.textMuted, fontSize: 11, fontFamily: 'monospace' }}
+                        title="来源位置：第几页第几行">
+                        第{String(r.metadata.page)}页
+                        {r.metadata.line_start != null && (
+                          <> 第{String(r.metadata.line_start)}-{String(r.metadata.line_end)}行</>
+                        )}
+                      </span>
+                    )}
+                  </div>
                   <span
                     style={{ ...s.pill, background: tokens.brandDeep, fontFamily: 'monospace' }}
                     title="库级检索相似度分"
                   >
-                    score {r.score.toFixed(3)}
+                    score {r.score.toFixed(4)}
                   </span>
                 </div>
                 <div style={{ fontSize: 14, lineHeight: 1.6, color: tokens.text }}>{r.text}</div>

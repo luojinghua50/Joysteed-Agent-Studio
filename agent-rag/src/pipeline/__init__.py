@@ -1,5 +1,6 @@
 import re
 from src.models import Chunk, ChunkingStrategy
+from src.extraction import PageSegment
 
 
 STRATEGY_MAPPING = {
@@ -24,6 +25,82 @@ class SmartSplitter:
     def _estimate_token_count(text: str) -> int:
         """Rough token estimate for storage/display only; char count keeps it dependency-free."""
         return len(text)
+
+    def split_segments(
+        self,
+        segments: list[PageSegment],
+        file_type: str = "txt",
+        strategy: ChunkingStrategy = ChunkingStrategy.AUTO,
+    ) -> list[Chunk]:
+        """Position-aware split: each PageSegment is split independently so that
+        every chunk carries page/line metadata for source traceability.
+
+        For non-positional strategies (table, qa_pair, parent_child) the segments
+        are concatenated and split as a whole — page metadata is set to the first
+        segment's page number since these strategies rely on document-level structure.
+        """
+        if strategy == ChunkingStrategy.AUTO:
+            strategy = STRATEGY_MAPPING.get(file_type, ChunkingStrategy.RECURSIVE)
+
+        # Strategies that need full-document context: concatenate first
+        if strategy in (ChunkingStrategy.TABLE, ChunkingStrategy.QA_PAIR,
+                        ChunkingStrategy.PARENT_CHILD, ChunkingStrategy.HEADING):
+            full_text = "\n\n".join(s["text"] for s in segments)
+            chunks = self.split(full_text, file_type, strategy)
+            # Attach page from first segment as approximate source
+            first_page = segments[0]["page"] if segments else 1
+            for ch in chunks:
+                ch.metadata.setdefault("page", first_page)
+            return chunks
+
+        # Recursive / fixed / semantic: split per page to preserve line positions
+        all_chunks: list[Chunk] = []
+        for seg in segments:
+            page_chunks = self._split_page_segment(seg, strategy)
+            all_chunks.extend(page_chunks)
+
+        # Re-index chunk ids sequentially across all pages
+        for i, ch in enumerate(all_chunks):
+            ch.id = f"chunk-{i:04d}"
+            ch.index = i
+        return all_chunks
+
+    def _split_page_segment(self, seg: PageSegment, strategy: ChunkingStrategy) -> list[Chunk]:
+        """Split one page segment and attach page + line_start + line_end to each chunk."""
+        lines = seg["lines"]
+        page = seg["page"]
+
+        if not lines:
+            return []
+
+        chunks: list[Chunk] = []
+
+        if strategy == ChunkingStrategy.FIXED:
+            raw_chunks = self._split_fixed(seg["text"])
+        else:
+            raw_chunks = self._split_recursive(seg["text"])
+
+        # Map each chunk back to its line range within the page
+        # by scanning lines sequentially and matching chunk text
+        line_cursor = 0
+        for ch in raw_chunks:
+            chunk_lines = [l for l in ch.text.splitlines() if l.strip()]
+            start_line = line_cursor + 1  # 1-based
+            # Advance cursor by the number of lines consumed
+            consumed = len(chunk_lines)
+            end_line = line_cursor + consumed
+            line_cursor = end_line
+
+            ch.metadata = {
+                **ch.metadata,
+                "page": page,
+                "line_start": start_line,
+                "line_end": min(end_line, len(lines)),
+                "total_lines": len(lines),
+            }
+            chunks.append(ch)
+
+        return chunks
 
     def split(
         self, text: str, file_type: str = "txt", strategy: ChunkingStrategy = ChunkingStrategy.AUTO

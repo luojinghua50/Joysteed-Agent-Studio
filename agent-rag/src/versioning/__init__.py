@@ -15,7 +15,7 @@ from sqlalchemy import select, func
 from src.db import (
     KnowledgeBaseModel, DocumentModel, DocumentVersionModel, ChunkModel, AuditLogModel,
 )
-from src.extraction import extract_text
+from src.extraction import extract_text, extract_with_position
 
 logger = structlog.get_logger()
 
@@ -106,8 +106,8 @@ class VersionManager:
 
             # build: chunk → persist chunks → index
             try:
-                text = extract_text(content, file_type)
-                chunks = splitter.split(text, file_type, kb.chunking_strategy)
+                segments = extract_with_position(content, file_type)
+                chunks = splitter.split_segments(segments, file_type, kb.chunking_strategy)
                 # 文档级元数据（category/effective_ts...）下沉到每个 chunk，供库内过滤
                 doc_meta = dict(doc.doc_metadata or {})
                 chunk_dicts = []

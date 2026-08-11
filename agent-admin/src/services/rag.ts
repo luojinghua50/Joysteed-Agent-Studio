@@ -114,16 +114,23 @@ export interface VersionInfo {
   is_current: boolean;
 }
 
+export interface ChunkPositionMeta {
+  page?: number;
+  line_start?: number;
+  line_end?: number;
+  total_lines?: number;
+  [key: string]: unknown;
+}
+
 export interface SearchResultItem {
   chunk_id: string;
   doc_id: string;
   text: string;
   score: number;
-  // route-search 溯源：命中来自哪个库、来源标签、版本号、元数据。
   kb_id?: string;
   source?: string;
   version_no?: number | null;
-  metadata?: Record<string, unknown>;
+  metadata?: ChunkPositionMeta;
 }
 
 export interface SearchResponse {

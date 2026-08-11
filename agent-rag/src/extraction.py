@@ -4,30 +4,51 @@ Supports PDF (via pypdf) and Word docx (via python-docx).
 Both libraries are optional — if not installed the function falls back to
 UTF-8 decode with errors='ignore', which is the original behaviour for
 plain-text formats.
+
+Position-aware extraction:
+  extract_with_position() returns a list of PageSegment dicts so callers
+  can attach page/line metadata to each chunk for source traceability.
 """
 import io
+from typing import TypedDict
+
+
+class PageSegment(TypedDict):
+    """One page (or logical section) extracted from a document."""
+    page: int          # 1-based page number
+    lines: list[str]   # non-empty lines in order
+    text: str          # full text of this segment (lines joined by \n)
 
 
 def extract_text(content: bytes, file_type: str) -> str:
-    """Return plain text from *content* bytes.
-
-    file_type should be the lowercase extension without the leading dot,
-    e.g. 'pdf', 'docx', 'txt', 'md'.
-    """
+    """Return plain text from *content* bytes (flat string, no position info)."""
     ft = file_type.lower()
-
     if ft == "pdf":
         return _extract_pdf(content)
-
     if ft in ("docx", "doc"):
         return _extract_docx(content)
-
     if ft in ("xlsx", "xls"):
         return _extract_xlsx(content)
-
-    # Plain-text formats: md, txt, csv, tsv, json, yaml, yml, log, etc.
     return content.decode("utf-8", errors="ignore")
 
+
+def extract_with_position(content: bytes, file_type: str) -> list[PageSegment]:
+    """Return structured per-page segments with line information.
+
+    Falls back to a single PageSegment when the format has no page concept
+    (plain text, docx, xlsx).
+    """
+    ft = file_type.lower()
+    if ft == "pdf":
+        return _extract_pdf_pages(content)
+    # For non-PDF formats produce a single synthetic segment so the pipeline
+    # can use the same code path regardless of file type.
+    text = extract_text(content, file_type)
+    lines = [l for l in text.splitlines() if l.strip()]
+    return [PageSegment(page=1, lines=lines, text=text)]
+
+
+# ── PDF ──────────────────────────────────────────────────────────────────────
 
 def _extract_pdf(content: bytes) -> str:
     try:
@@ -42,6 +63,24 @@ def _extract_pdf(content: bytes) -> str:
         if text:
             parts.append(text)
     return "\n\n".join(parts)
+
+
+def _extract_pdf_pages(content: bytes) -> list[PageSegment]:
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        text = content.decode("utf-8", errors="ignore")
+        lines = [l for l in text.splitlines() if l.strip()]
+        return [PageSegment(page=1, lines=lines, text=text)]
+
+    reader = PdfReader(io.BytesIO(content))
+    segments: list[PageSegment] = []
+    for page_no, page in enumerate(reader.pages, start=1):
+        raw = page.extract_text() or ""
+        lines = [l for l in raw.splitlines() if l.strip()]
+        if lines:
+            segments.append(PageSegment(page=page_no, lines=lines, text="\n".join(lines)))
+    return segments
 
 
 def _extract_docx(content: bytes) -> str:

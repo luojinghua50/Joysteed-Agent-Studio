@@ -172,7 +172,8 @@ class MilvusRetriever(BaseRetriever):
         mode = resolve_mode(getattr(request, "mode", None), kb_mode)
         top_k = request.top_k or 5
         self.client.load_collection(collection)
-        out_fields = ["chunk_id", "doc_id", "text", "parent_text", "context_header"]
+        out_fields = ["chunk_id", "doc_id", "text", "parent_text", "context_header",
+                      "page", "line_start", "line_end", "total_lines"]
 
         if mode == MODE_FULLTEXT:
             hits = self.client.search(
@@ -222,13 +223,12 @@ class MilvusRetriever(BaseRetriever):
 
     @staticmethod
     def _to_results(hits, kb_id: str) -> list[SearchResult]:
+        _SKIP = {"chunk_id", "doc_id", "text", "parent_text"}
         results = []
         for hit in (hits[0] if hits else []):
             entity = hit.get("entity", {})
-            metadata = {
-                k: v for k, v in entity.items()
-                if k not in {"chunk_id", "doc_id", "text"}
-            }
+            # position fields always go into metadata so callers can surface them
+            metadata = {k: v for k, v in entity.items() if k not in _SKIP and v is not None}
             results.append(SearchResult(
                 chunk_id=entity.get("chunk_id", ""), doc_id=entity.get("doc_id", ""),
                 text=entity.get("parent_text") or entity.get("text", ""),
