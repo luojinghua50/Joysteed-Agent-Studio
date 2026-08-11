@@ -8,7 +8,7 @@ COPY pyproject.toml .
 COPY src/ src/
 COPY init_data.py .
 
-RUN uv pip install --system ".[vector]"
+RUN uv pip install --system --index-url https://pypi.tuna.tsinghua.edu.cn/simple ".[vector,parsers]"
 
 EXPOSE 8010
 

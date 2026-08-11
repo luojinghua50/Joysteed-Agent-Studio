@@ -9,15 +9,16 @@ versions stay indexed but invisible).
 Each collection carries a dense FLOAT_VECTOR (semantic) and a SPARSE_FLOAT_VECTOR
 fed by Milvus' built-in BM25 function over the analyzed text field. Search runs
 in one of three modes (vector / fulltext / hybrid); hybrid fuses dense + sparse
-in-collection via RRFRanker through a single hybrid_search call. Metadata scalar
-filtering compiles into the same boolean expression applied to every mode.
+raw dense/sparse search and Python RRF so score_threshold keeps raw-score semantics.
+Metadata scalar filtering compiles into the same boolean expression applied to every mode.
 """
 import re
+import threading
 
 import structlog
 
 from src.models import SearchResult, SearchRequest
-from src.retrieval import BaseRetriever
+from src.retrieval import BaseRetriever, apply_score_threshold, reciprocal_rank_fusion
 from src.embedding import Embedder
 
 logger = structlog.get_logger()
@@ -75,6 +76,7 @@ class MilvusRetriever(BaseRetriever):
         self.settings = settings
         self.embedder = Embedder(settings)
         self.client = MilvusClient(uri=f"http://{settings.milvus_host}:{settings.milvus_port}")
+        self._ensure_lock = threading.Lock()
         # 已确保存在的 collection 名缓存，避免每次 has_collection RPC
         self._ensured: set[str] = set()
 
@@ -83,48 +85,61 @@ class MilvusRetriever(BaseRetriever):
 
         if collection in self._ensured:
             return
-        if self.client.has_collection(collection):
+        with self._ensure_lock:
+            if collection in self._ensured:
+                return
+            if self.client.has_collection(collection):
+                self._ensured.add(collection)
+                return
+            try:
+                schema = self.client.create_schema(auto_id=False, enable_dynamic_field=True)
+                schema.add_field("chunk_id", DataType.VARCHAR, is_primary=True, max_length=32)
+                schema.add_field("version_id", DataType.VARCHAR, max_length=24)
+                schema.add_field("doc_id", DataType.VARCHAR, max_length=16)
+                schema.add_field("kb_id", DataType.VARCHAR, max_length=16)
+                # text 开 analyzer，供 BM25 function 切词；中文用 jieba 分析器（步骤7 验证调优）
+                schema.add_field("text", DataType.VARCHAR, max_length=8192,
+                                 enable_analyzer=True, analyzer_params={"type": "chinese"})
+                schema.add_field("dense", DataType.FLOAT_VECTOR, dim=self.settings.embedding_dim)
+                # 稀疏 BM25 向量：由 Milvus 内建 BM25 function 从 text 自动生成
+                schema.add_field("sparse", DataType.SPARSE_FLOAT_VECTOR)
+                schema.add_function(Function(
+                    name="text_bm25", function_type=FunctionType.BM25,
+                    input_field_names=["text"], output_field_names=["sparse"],
+                ))
+
+                index_params = self.client.prepare_index_params()
+                index_params.add_index("dense", index_type="HNSW", metric_type="IP",
+                                       params={"M": 16, "efConstruction": 200})
+                index_params.add_index("sparse", index_type="SPARSE_INVERTED_INDEX",
+                                       metric_type="BM25")
+                index_params.add_index("version_id", index_type="INVERTED")
+                self.client.create_collection(collection, schema=schema, index_params=index_params)
+                logger.info("milvus_collection_created", collection=collection)
+            except Exception as e:
+                message = str(e).lower()
+                if "exist" in message or "already" in message:
+                    logger.info("milvus_collection_exists_after_race", collection=collection)
+                elif self.client.has_collection(collection):
+                    logger.info("milvus_collection_exists_after_race", collection=collection)
+                else:
+                    raise
             self._ensured.add(collection)
-            return
-        schema = self.client.create_schema(auto_id=False, enable_dynamic_field=True)
-        schema.add_field("chunk_id", DataType.VARCHAR, is_primary=True, max_length=32)
-        schema.add_field("version_id", DataType.VARCHAR, max_length=24)
-        schema.add_field("doc_id", DataType.VARCHAR, max_length=16)
-        schema.add_field("kb_id", DataType.VARCHAR, max_length=16)
-        # text 开 analyzer，供 BM25 function 切词；中文用 jieba 分析器（步骤7 验证调优）
-        schema.add_field("text", DataType.VARCHAR, max_length=8192,
-                         enable_analyzer=True, analyzer_params={"type": "chinese"})
-        schema.add_field("dense", DataType.FLOAT_VECTOR, dim=self.settings.embedding_dim)
-        # 稀疏 BM25 向量：由 Milvus 内建 BM25 function 从 text 自动生成
-        schema.add_field("sparse", DataType.SPARSE_FLOAT_VECTOR)
-        schema.add_function(Function(
-            name="text_bm25", function_type=FunctionType.BM25,
-            input_field_names=["text"], output_field_names=["sparse"],
-        ))
 
-        index_params = self.client.prepare_index_params()
-        index_params.add_index("dense", index_type="HNSW", metric_type="IP",
-                               params={"M": 16, "efConstruction": 200})
-        index_params.add_index("sparse", index_type="SPARSE_INVERTED_INDEX",
-                               metric_type="BM25")
-        index_params.add_index("version_id", index_type="INVERTED")
-        self.client.create_collection(collection, schema=schema, index_params=index_params)
-        self._ensured.add(collection)
-        logger.info("milvus_collection_created", collection=collection)
-
-    async def index_chunks(self, kb_id: str, chunks: list[dict]):
+    async def index_chunks(self, kb_id: str, chunks: list[dict], embedding_model: str | None = None):
         if not chunks:
             return
         collection = collection_name_for(kb_id)
         self._ensure_collection(collection)
         texts = [c["text"] for c in chunks]
-        vectors = await self.embedder.embed_batch(texts)
+        vectors = await self.embedder.embed_batch(texts, model_name=embedding_model)
         rows = []
         for c, vec in zip(chunks, vectors):
             row = {
                 "chunk_id": c["id"], "version_id": c.get("version_id", ""),
                 "doc_id": c.get("doc_id", ""), "kb_id": kb_id,
                 "text": c["text"][:8192], "dense": vec,
+                "context_header": c.get("context_header", ""),
             }
             # 元数据字段下沉为动态字段（步骤3 会对要过滤的字段建标量索引）
             for k, v in (c.get("metadata") or {}).items():
@@ -155,55 +170,71 @@ class MilvusRetriever(BaseRetriever):
         expr = " && ".join(exprs)
 
         mode = resolve_mode(getattr(request, "mode", None), kb_mode)
+        top_k = request.top_k or 5
         self.client.load_collection(collection)
-        out_fields = ["chunk_id", "doc_id", "text"]
+        out_fields = ["chunk_id", "doc_id", "text", "parent_text", "context_header",
+                      "page", "line_start", "line_end", "total_lines"]
 
         if mode == MODE_FULLTEXT:
             hits = self.client.search(
                 collection_name=collection, data=[request.query], anns_field="sparse",
-                filter=expr, limit=request.top_k, output_fields=out_fields,
+                filter=expr or None, limit=top_k, output_fields=out_fields,
             )
-            return self._to_results(hits, request.kb_id)
+            results = self._to_results(hits, request.kb_id)
+            return apply_score_threshold(results, getattr(request, "score_threshold", 0.0))[:top_k]
 
-        query_vec = (await self.embedder.embed_batch([request.query]))[0]
+        query_vec = (await self.embedder.embed_batch(
+            [request.query], model_name=getattr(request, "embedding_model", None)
+        ))[0]
         if mode == MODE_VECTOR:
             hits = self.client.search(
                 collection_name=collection, data=[query_vec], anns_field="dense",
-                filter=expr, limit=request.top_k, output_fields=out_fields,
+                filter=expr or None, limit=top_k, output_fields=out_fields,
             )
-            return self._to_results(hits, request.kb_id)
+            results = self._to_results(hits, request.kb_id)
+            return apply_score_threshold(results, getattr(request, "score_threshold", 0.0))[:top_k]
 
-        # hybrid：稠密 + 稀疏(BM25) 库内 RRF 融合，一次 hybrid_search 完成
+        # hybrid：raw dense/sparse 搜索各自做阈值过滤，再用 Python RRF 融合，
+        # 这样 score_threshold 仍然是原始召回分语义，不会落到 Milvus fused score。
         return self._hybrid_search(collection, request, query_vec, expr, out_fields)
 
     def _hybrid_search(self, collection, request, query_vec, expr, out_fields):
-        from pymilvus import AnnSearchRequest, RRFRanker
+        top_k = request.top_k or 5
+        recall = max(top_k, 20)
+        threshold = getattr(request, "score_threshold", 0.0)
 
-        recall = max(request.top_k, 20)
-        dense_req = AnnSearchRequest(
-            data=[query_vec], anns_field="dense",
-            param={"metric_type": "IP"}, limit=recall, expr=expr or None,
+        dense_hits = self.client.search(
+            collection_name=collection, data=[query_vec], anns_field="dense",
+            filter=expr or None, limit=recall, output_fields=out_fields,
         )
-        sparse_req = AnnSearchRequest(
-            data=[request.query], anns_field="sparse",
-            param={"metric_type": "BM25"}, limit=recall, expr=expr or None,
+        sparse_hits = self.client.search(
+            collection_name=collection, data=[request.query], anns_field="sparse",
+            filter=expr or None, limit=recall, output_fields=out_fields,
         )
-        hits = self.client.hybrid_search(
-            collection_name=collection,
-            reqs=[dense_req, sparse_req],
-            ranker=RRFRanker(60),
-            limit=request.top_k, output_fields=out_fields,
-        )
-        return self._to_results(hits, request.kb_id)
+        dense = apply_score_threshold(self._to_results(dense_hits, request.kb_id), threshold)
+        sparse = apply_score_threshold(self._to_results(sparse_hits, request.kb_id), threshold)
+        return reciprocal_rank_fusion(
+            [dense, sparse],
+            weights=[
+                getattr(request, "vector_weight", 0.6),
+                getattr(request, "keyword_weight", 0.4),
+            ],
+        )[:top_k]
 
     @staticmethod
     def _to_results(hits, kb_id: str) -> list[SearchResult]:
+        _SKIP = {"chunk_id", "doc_id", "text", "parent_text"}
         results = []
         for hit in (hits[0] if hits else []):
             entity = hit.get("entity", {})
+            # position fields always go into metadata so callers can surface them
+            metadata = {k: v for k, v in entity.items() if k not in _SKIP and v is not None}
             results.append(SearchResult(
                 chunk_id=entity.get("chunk_id", ""), doc_id=entity.get("doc_id", ""),
-                text=entity.get("text", ""), score=float(hit.get("distance", 0.0)),
+                text=entity.get("parent_text") or entity.get("text", ""),
+                score=float(hit.get("distance", 0.0)),
+                metadata=metadata,
+                source=entity.get("context_header", ""),
                 kb_id=kb_id,
             ))
         return results
@@ -241,4 +272,3 @@ class MilvusRetriever(BaseRetriever):
         except Exception as e:  # pragma: no cover - depends on external Milvus
             logger.warning("milvus_scalar_index_failed",
                            collection=collection, field=field_name, error=str(e))
-

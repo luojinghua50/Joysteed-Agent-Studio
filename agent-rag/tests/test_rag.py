@@ -1,4 +1,8 @@
 import json
+import sys
+import threading
+import time
+import types
 
 import pytest
 from httpx import AsyncClient, ASGITransport
@@ -11,13 +15,14 @@ from src.retrieval import (
     MODE_VECTOR, MODE_FULLTEXT, MODE_HYBRID,
 )
 from src.routing import SearchRouter, KbPlan, apply_temporal_filters as _apply_temporal
+from src.retrieval.milvus_backend import MilvusRetriever, collection_name_for
 from src.models import SearchRequest, ChunkingStrategy, SearchResult as _SR
 
 
 @pytest.fixture
 async def app():
     # In-memory SQLite + memory retrieval/object-store so tests need no external deps.
-    settings = RAGSettings(database_url="sqlite+aiosqlite:///:memory:")
+    settings = RAGSettings(_env_file=None, debug=False, database_url="sqlite+aiosqlite:///:memory:")
     application = create_app(settings)
     # ASGITransport does not run lifespan, so init the DB factory explicitly.
     application.state.db_session_factory = await init_db(settings.database_url)
@@ -95,15 +100,75 @@ async def test_update_shortcut_threshold_validation(client):
     # 空 body（无可更新字段）→ 400
     assert (await client.patch(f"/api/knowledge-bases/{faq['id']}")).status_code == 400
 
-    # 非 faq 库不允许改阈值 → 400
+    # 配置页统一开放检索参数，非 faq 库也可保存；只是短路逻辑只对 faq 生效。
     std = (await client.post("/api/knowledge-bases",
                              params={"name": "std_v", "kb_form": "standard"})).json()
-    assert (await client.patch(f"/api/knowledge-bases/{std['id']}",
-                               params={"shortcut_threshold": 0.5})).status_code == 400
+    resp = await client.patch(f"/api/knowledge-bases/{std['id']}",
+                              params={"shortcut_threshold": 0.5})
+    assert resp.status_code == 200
+    assert resp.json()["shortcut_threshold"] == 0.5
 
     # 不存在的库 → 404
     assert (await client.patch("/api/knowledge-bases/nope",
                                params={"shortcut_threshold": 0.5})).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_create_and_update_kb_explicit_config(client):
+    resp = await client.post("/api/knowledge-bases", params={
+        "name": "cfg_kb",
+        "kb_form": "standard",
+        "strategy": "recursive",
+        "chunk_size": 800,
+        "chunk_overlap": 80,
+        "retrieval_mode": "hybrid",
+        "top_k": 9,
+        "vector_weight": 0.75,
+        "keyword_weight": 0.25,
+        "score_threshold": 0.2,
+        "embedding_model": "BAAI/bge-large-zh-v1.5",
+        "rerank_model": "BAAI/bge-reranker-large",
+    })
+    assert resp.status_code == 200
+    kb = resp.json()
+    assert kb["chunking_strategy"] == "recursive"
+    assert kb["chunk_size"] == 800
+    assert kb["chunk_overlap"] == 80
+    assert kb["retrieval_mode"] == "hybrid"
+    assert kb["top_k"] == 9
+    assert kb["vector_weight"] == 0.75
+    assert kb["keyword_weight"] == 0.25
+    assert kb["score_threshold"] == 0.2
+    assert kb["embedding_model"] == "BAAI/bge-large-zh-v1.5"
+    assert kb["rerank_model"] == "BAAI/bge-reranker-large"
+
+    updated = await client.patch(f"/api/knowledge-bases/{kb['id']}", params={
+        "name": "cfg_kb_renamed",
+        "description": "updated description",
+        "kb_form": "faq",
+        "chunking_strategy": "parent_child",
+        "retrieval_mode": "vector",
+        "top_k": 7,
+        "vector_weight": 1.0,
+        "keyword_weight": 0.0,
+        "score_threshold": 0.1,
+    })
+    assert updated.status_code == 200
+    body = updated.json()
+    assert body["name"] == "cfg_kb_renamed"
+    assert body["description"] == "updated description"
+    assert body["kb_form"] == "faq"
+    assert body["chunking_strategy"] == "parent_child"
+    assert body["retrieval_mode"] == "vector"
+    assert body["top_k"] == 7
+    assert body["vector_weight"] == 1.0
+    assert body["keyword_weight"] == 0.0
+    assert body["score_threshold"] == 0.1
+
+    assert (await client.patch(f"/api/knowledge-bases/{kb['id']}", params={
+        "vector_weight": 0.8,
+        "keyword_weight": 0.8,
+    })).status_code == 400
 
 
 @pytest.mark.asyncio
@@ -270,6 +335,14 @@ class TestSmartSplitter:
         chunks = splitter.split(text, "txt", ChunkingStrategy.QA_PAIR)
         assert len(chunks) >= 2
 
+    def test_split_parent_child_keeps_heading_context(self):
+        text = "# 退换货\n\n七天无理由。\n\n# 配送\n\n三到五天。"
+        splitter = SmartSplitter(chunk_size=500)
+        chunks = splitter.split(text, "md", ChunkingStrategy.PARENT_CHILD)
+        assert len(chunks) >= 2
+        assert chunks[0].context_header.startswith("#")
+        assert chunks[0].metadata["parent_text"].startswith("# 退换货")
+
 
 class TestRetrievalEngine:
     @pytest.mark.asyncio
@@ -288,6 +361,18 @@ class TestRetrievalEngine:
         engine = RetrievalEngine()
         results = await engine.search(SearchRequest(query="test", kb_id="nonexistent", top_k=5))
         assert results == []
+
+    @pytest.mark.asyncio
+    async def test_parent_child_returns_parent_text(self):
+        engine = RetrievalEngine()
+        await engine.index_chunks("kb1", [
+            {
+                "id": "c1", "doc_id": "d1", "text": "七天无理由",
+                "keywords": [], "metadata": {"parent_text": "# 退换货\n\n七天无理由。完整流程如下。"},
+            },
+        ])
+        results = await engine.search(SearchRequest(query="七天", kb_id="kb1", top_k=5))
+        assert results[0].text.startswith("# 退换货")
 
 
 # ===== 步骤3: 元数据过滤 =====
@@ -407,6 +492,10 @@ def test_rrf_fusion_accumulates_and_orders():
     assert set(ids) == {"c1", "c2", "c3"}
     # 融合分写回 score，且 c2 分最高
     assert fused[0].score == max(r.score for r in fused)
+    assert [r.score for r in a] == [0.9, 0.8]
+    assert [r.score for r in b] == [0.7, 0.6]
+    assert fused[0] is not a[1]
+    assert fused[0] is not b[0]
 
 
 def test_rrf_fusion_weights():
@@ -459,6 +548,237 @@ async def test_search_endpoint_respects_request_mode(client):
         "query": "退换货", "kb_id": kb_id, "top_k": 5, "mode": "vector",
     })).json()
     assert data["total"] >= 1
+
+
+class _FakeMilvusSchema:
+    def add_field(self, *args, **kwargs):
+        return None
+
+    def add_function(self, *args, **kwargs):
+        return None
+
+
+class _FakeMilvusIndexParams:
+    def add_index(self, *args, **kwargs):
+        return None
+
+
+class _SlowMilvusClient:
+    def __init__(self):
+        self.exists = False
+        self.create_calls = 0
+
+    def has_collection(self, collection):
+        return self.exists
+
+    def create_schema(self, *args, **kwargs):
+        return _FakeMilvusSchema()
+
+    def prepare_index_params(self):
+        return _FakeMilvusIndexParams()
+
+    def create_collection(self, *args, **kwargs):
+        time.sleep(0.05)
+        self.create_calls += 1
+        self.exists = True
+
+
+class _HybridFakeClient:
+    def __init__(self):
+        self.calls = []
+
+    def has_collection(self, collection):
+        return True
+
+    def load_collection(self, collection):
+        self.calls.append(("load", collection))
+
+    def search(self, collection_name, data, anns_field, filter=None, limit=None, output_fields=None, search_params=None):
+        self.calls.append(("search", anns_field, limit, filter))
+        if anns_field == "dense":
+            return [[{"distance": 0.92, "entity": {"chunk_id": "dense", "doc_id": "d", "text": "dense text", "kb_id": "kb1"}}]]
+        if anns_field == "sparse":
+            return [[{"distance": 0.10, "entity": {"chunk_id": "sparse", "doc_id": "d", "text": "sparse text", "kb_id": "kb1"}}]]
+        raise AssertionError(f"unexpected anns_field: {anns_field}")
+
+    def hybrid_search(self, *args, **kwargs):
+        raise AssertionError("native hybrid_search should not be used")
+
+
+class _FakeEmbedder:
+    async def embed_batch(self, texts, model_name=None):
+        return [[0.1, 0.2, 0.3] for _ in texts]
+
+
+class _FailingRetriever:
+    async def index_chunks(self, kb_id, chunks, embedding_model=None):
+        raise RuntimeError("boom")
+
+
+class _CleanupStore:
+    def __init__(self):
+        self.put_keys = []
+        self.deleted_prefixes = []
+
+    def build_key(self, tenant_id, kb_id, doc_id, version_no, filename):
+        return f"{tenant_id}/{kb_id}/{doc_id}/v{version_no}/{filename}"
+
+    async def put(self, key, data, content_type="application/octet-stream"):
+        self.put_keys.append(key)
+        return key
+
+    async def delete_prefix(self, prefix):
+        self.deleted_prefixes.append(prefix)
+        return 1
+
+
+class _ProbeTrackingRetriever:
+    def __init__(self):
+        self.calls = []
+
+    async def search(self, request, visible_version_ids=None, kb_mode=None):
+        self.calls.append((request.kb_id, kb_mode, request.top_k))
+        if request.kb_id == "faq_kb" and kb_mode == "vector":
+            return [_SR(chunk_id="probe", doc_id="d", text="退换货政策", score=0.9)]
+        if request.kb_id == "faq_kb":
+            return [_SR(chunk_id="faq", doc_id="d", text="退换货政策", score=0.8)]
+        if request.kb_id == "std_kb":
+            raise AssertionError("standard kb should not be searched when faq shortcut hits")
+        return []
+
+
+
+
+@pytest.mark.asyncio
+async def test_milvus_hybrid_uses_raw_search_and_thresholds_before_rrf():
+    retriever = MilvusRetriever.__new__(MilvusRetriever)
+    retriever.settings = RAGSettings(_env_file=None, debug=False)
+    retriever.client = _HybridFakeClient()
+    retriever.embedder = _FakeEmbedder()
+    retriever._ensured = set()
+    retriever._ensure_lock = threading.Lock()
+
+    req = SearchRequest(query="退换货", kb_id="kb1", top_k=2, mode="hybrid", score_threshold=0.2)
+    out = await retriever.search(req)
+    assert [r.chunk_id for r in out] == ["dense"]
+    assert [call[1] for call in retriever.client.calls if call[0] == "search"] == ["dense", "sparse"]
+    assert all(call[0] != "hybrid_search" for call in retriever.client.calls)
+
+
+def test_milvus_ensure_collection_is_serialized(monkeypatch):
+    fake_pymilvus = types.SimpleNamespace(
+        DataType=types.SimpleNamespace(
+            VARCHAR="VARCHAR", FLOAT_VECTOR="FLOAT_VECTOR", SPARSE_FLOAT_VECTOR="SPARSE_FLOAT_VECTOR"
+        ),
+        Function=lambda *args, **kwargs: object(),
+        FunctionType=types.SimpleNamespace(BM25="BM25"),
+    )
+    monkeypatch.setitem(sys.modules, "pymilvus", fake_pymilvus)
+
+    retriever = MilvusRetriever.__new__(MilvusRetriever)
+    retriever.settings = RAGSettings(_env_file=None, debug=False)
+    retriever.client = _SlowMilvusClient()
+    retriever._ensured = set()
+    retriever._ensure_lock = threading.Lock()
+
+    collection = collection_name_for("kb1")
+
+    def worker():
+        retriever._ensure_collection(collection)
+
+    t1 = threading.Thread(target=worker)
+    t2 = threading.Thread(target=worker)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    assert retriever.client.create_calls == 1
+    assert collection in retriever._ensured
+
+
+@pytest.mark.asyncio
+async def test_version_build_cleans_up_minio_on_failure(app):
+    from sqlalchemy import select
+    from src.db import KnowledgeBaseModel, DocumentModel, DocumentVersionModel
+    from src.versioning import VersionManager
+
+    store = _CleanupStore()
+    vm = VersionManager(RAGSettings(_env_file=None, debug=False), _FailingRetriever(), store)
+
+    async with app.state.db_session_factory() as db:
+        kb = KnowledgeBaseModel(id="kb_cleanup", tenant_id="default", name="cleanup")
+        doc = DocumentModel(id="doc_cleanup", tenant_id="default", kb_id=kb.id, filename="cleanup.md")
+        db.add(kb)
+        db.add(doc)
+        await db.commit()
+        await db.refresh(kb)
+        await db.refresh(doc)
+
+        splitter = SmartSplitter(chunk_size=500)
+        with pytest.raises(RuntimeError):
+            await vm.add_version(
+                db, kb, doc, "# 标题\n\n内容".encode("utf-8"), "cleanup.md", "text/markdown", splitter
+            )
+
+        ver = (await db.execute(
+            select(DocumentVersionModel).where(DocumentVersionModel.doc_id == doc.id)
+        )).scalars().one()
+        assert ver.status == "failed"
+        assert len(store.put_keys) == 1
+        assert store.deleted_prefixes == store.put_keys
+
+
+@pytest.mark.asyncio
+async def test_reranker_accepts_score_objects_and_float_like_values(monkeypatch):
+    from src.config import RAGSettings
+    from src.rerank import Reranker
+
+    class _ScoreObj:
+        def __init__(self, score):
+            self.score = score
+
+    class _FloatLike:
+        def __init__(self, score):
+            self._score = score
+
+        def __float__(self):
+            return self._score
+
+    class _Model:
+        def rerank(self, query, texts):
+            return [_ScoreObj(0.1), _FloatLike(0.9)]
+
+    rr = Reranker(RAGSettings(_env_file=None, debug=False, rerank_provider="fastembed"))
+    rr._models[rr.settings.rerank_model] = _Model()
+    monkeypatch.setattr(rr, "_ensure_fastembed", lambda model: True)
+
+    items = [
+        _SR(chunk_id="low", doc_id="d", text="low", score=0.2),
+        _SR(chunk_id="high", doc_id="d", text="high", score=0.8),
+    ]
+    out, flag = await rr.rerank("q", items, top_k=2)
+    assert flag is True
+    assert [r.text for r in out] == ["high", "low"]
+    assert 0.5 < out[0].score < 1.0
+    assert [r.score for r in items] == [0.2, 0.8]
+    assert out[0] is not items[1]
+
+
+@pytest.mark.asyncio
+async def test_router_faq_shortcut_probes_before_full_search():
+    retriever = _ProbeTrackingRetriever()
+    router = SearchRouter(retriever)
+    plans = [
+        KbPlan(kb_id="faq_kb", kb_form="faq", retrieval_mode="fulltext", priority_weight=1.0, shortcut_threshold=0.5),
+        KbPlan(kb_id="std_kb", kb_form="standard", retrieval_mode="hybrid", priority_weight=0.7),
+    ]
+
+    resp = await router.route("退换货政策", plans, top_k=3)
+    assert resp.shortcut is True
+    assert resp.routed_kbs == ["faq_kb"]
+    assert [call[:2] for call in retriever.calls] == [("faq_kb", "vector"), ("faq_kb", "fulltext")]
+    assert resp.results[0].chunk_id == "faq"
 
 
 # ===== 步骤5: 检索路由层（faq 短路 + 跨库加权 RRF） =====

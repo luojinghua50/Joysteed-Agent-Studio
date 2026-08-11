@@ -183,6 +183,28 @@ flowchart TB
 
 **The journey of one request:** a customer asks in `agent-web` → the supervisor in `agent-core` identifies intent and dispatches to a business agent → the agent calls MCP tools (look up order / file ticket) and retrieves knowledge via `agent-rag` → litellm picks a suitable model to generate the reply → traces are reported to the observability stack throughout; if the AI can't resolve it, the case is escalated to `agent-desk` for a human agent.
 
+## 📚 Knowledge Base Management
+
+`agent-admin` provides a full knowledge-base admin console covering everything from initial configuration to live validation.
+
+<div align="center">
+  <img src="docs/images/kb_list.png" alt="Knowledge base list" width="700" />
+  <br/>
+  <em>Knowledge base list: centrally manage multiple bases, showing document count, version status, and enabled state</em>
+</div>
+
+<div align="center">
+  <img src="docs/images/kb_add.png" alt="Create knowledge base" width="700" />
+  <br/>
+  <em>Create a knowledge base: configure name, description, chunking strategy, and embedding parameters; supports multiple document formats</em>
+</div>
+
+<div align="center">
+  <img src="docs/images/kb_manage_test.png" alt="Manage documents and test retrieval" width="700" />
+  <br/>
+  <em>Document management and version publishing: upload documents, trigger index builds, publish new versions, and validate retrieval quality with live queries</em>
+</div>
+
 ## 📦 Modules
 
 | Module | Stack | Responsibility |

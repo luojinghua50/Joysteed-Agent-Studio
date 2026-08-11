@@ -15,30 +15,28 @@ class Embedder:
         self.settings = settings
         self.provider = settings.embedding_provider
         self.dim = settings.embedding_dim
-        self._fastembed = None
+        self._fastembed: dict[str, object] = {}
         self._openai = None
         if self.provider == "openai":
             self._init_openai()
 
-    def _ensure_fastembed(self) -> bool:
-        if self._fastembed is not None:
+    def _ensure_fastembed(self, model_name: str) -> bool:
+        if model_name in self._fastembed:
             return True
         try:
             from fastembed import TextEmbedding
 
             cache_dir = getattr(self.settings, "fastembed_cache_path", None)
-            self._fastembed = TextEmbedding(
-                model_name=self.settings.embedding_model,
+            self._fastembed[model_name] = TextEmbedding(
+                model_name=model_name,
                 cache_dir=cache_dir,
                 lazy_load=True,
                 local_files_only=True,
             )
-            logger.info("fastembed_ready", model=self.settings.embedding_model, cache_dir=cache_dir)
+            logger.info("fastembed_ready", model=model_name, cache_dir=cache_dir)
             return True
         except Exception as e:  # pragma: no cover - depends on model download
-            logger.warning("fastembed_init_failed_fallback_pseudo", error=str(e))
-            self.provider = "pseudo"
-            self._fastembed = None
+            logger.warning("fastembed_init_failed_fallback_pseudo", model=model_name, error=str(e))
             return False
 
     def _init_openai(self):
@@ -53,27 +51,28 @@ class Embedder:
             logger.warning("openai_embed_init_failed_fallback_pseudo", error=str(e))
             self.provider = "pseudo"
 
-    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
-        if self.provider == "fastembed" and self._ensure_fastembed():
+    async def embed_batch(self, texts: list[str], model_name: str | None = None) -> list[list[float]]:
+        model = model_name or self.settings.embedding_model
+        if self.provider == "fastembed" and self._ensure_fastembed(model):
             # fastembed is sync/CPU; run in a thread to avoid blocking the loop.
             import asyncio
 
             try:
-                vecs = await asyncio.to_thread(lambda: list(self._fastembed.embed(texts)))
+                vecs = await asyncio.to_thread(lambda: list(self._fastembed[model].embed(texts)))
                 return [v.tolist() for v in vecs]
             except Exception as e:  # pragma: no cover - depends on model/runtime
-                logger.warning("fastembed_embed_failed_fallback_pseudo", error=str(e))
-                self.provider = "pseudo"
-                self._fastembed = None
+                logger.warning("fastembed_embed_failed_fallback_pseudo", model=model, error=str(e))
+                self._fastembed.pop(model, None)
         if self.provider == "openai" and self._openai:
             resp = await self._openai.embeddings.create(
-                model=self.settings.embedding_model, input=texts,
+                model=model, input=texts,
             )
             return [d.embedding for d in resp.data]
-        return [self._pseudo_vector(t) for t in texts]
+        return [self._pseudo_vector(t, model) for t in texts]
 
-    def _pseudo_vector(self, text: str) -> list[float]:
+    def _pseudo_vector(self, text: str, model_name: str | None = None) -> list[float]:
         """Deterministic fallback vector so the pipeline runs without a model."""
-        seed = hashlib.sha256(text.encode("utf-8")).digest()
+        seed_text = f"{model_name or self.settings.embedding_model}\n{text}"
+        seed = hashlib.sha256(seed_text.encode("utf-8")).digest()
         vals = [(b / 255.0) for b in seed]  # 32 floats
         return [vals[i % len(vals)] for i in range(self.dim)]

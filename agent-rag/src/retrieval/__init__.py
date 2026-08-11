@@ -16,6 +16,13 @@ MODE_FULLTEXT = "fulltext"  # 仅稀疏 BM25（关键词）
 MODE_HYBRID = "hybrid"      # 稠密+稀疏，库内 RRF 融合
 
 
+def apply_score_threshold(results: list[SearchResult], threshold: float = 0.0) -> list[SearchResult]:
+    """Filter low-confidence results. threshold=0 keeps existing behavior."""
+    if threshold <= 0:
+        return results
+    return [r for r in results if r.score >= threshold]
+
+
 def resolve_mode(request_mode: str | None, kb_mode: str | None) -> str:
     """请求级 mode 覆盖库级 retrieval_mode；都缺省则 hybrid。"""
     mode = (request_mode or kb_mode or MODE_HYBRID).lower()
@@ -29,7 +36,8 @@ def reciprocal_rank_fusion(
 ) -> list[SearchResult]:
     """RRF 融合多路检索结果：score = Σ weight / (k + rank)。
 
-    rank 从 1 起算。同一 chunk 在多路命中则分数累加，融合分写回 result.score。
+    rank 从 1 起算。同一 chunk 在多路命中则分数累加，融合分写回新对象的 score，
+    不会原地污染输入列表里的 SearchResult。
     """
     if weights is None:
         weights = [1.0] * len(result_lists)
@@ -44,8 +52,7 @@ def reciprocal_rank_fusion(
     fused = []
     for cid in ordered:
         r = chunk_map[cid]
-        r.score = round(scores[cid], 6)
-        fused.append(r)
+        fused.append(r.model_copy(update={"score": round(scores[cid], 6)}, deep=True))
     return fused
 
 
@@ -79,7 +86,7 @@ def match_filters(meta: dict, filters: list) -> bool:
 
 
 class BaseRetriever:
-    async def index_chunks(self, kb_id: str, chunks: list[dict]):
+    async def index_chunks(self, kb_id: str, chunks: list[dict], embedding_model: str | None = None):
         raise NotImplementedError
 
     async def search(self, request: SearchRequest, visible_version_ids: list[str] | None = None,
@@ -107,7 +114,7 @@ class MemoryRetriever(BaseRetriever):
     def __init__(self):
         self._chunks: dict[str, list[dict]] = {}
 
-    async def index_chunks(self, kb_id: str, chunks: list[dict]):
+    async def index_chunks(self, kb_id: str, chunks: list[dict], embedding_model: str | None = None):
         self._chunks.setdefault(kb_id, []).extend(chunks)
 
     @staticmethod
@@ -118,12 +125,13 @@ class MemoryRetriever(BaseRetriever):
         return {t[i:i + n] for i in range(len(t) - n + 1)}
 
     def _result_of(self, chunk: dict, kb_id: str, score: float) -> SearchResult:
+        metadata = chunk.get("metadata", {}) or chunk.get("meta", {})
         return SearchResult(
             chunk_id=chunk.get("id", ""),
             doc_id=chunk.get("doc_id", ""),
-            text=chunk.get("text", ""),
+            text=metadata.get("parent_text") or chunk.get("text", ""),
             score=score,
-            metadata=chunk.get("metadata", {}) or chunk.get("meta", {}),
+            metadata=metadata,
             source=chunk.get("context_header", ""),
             kb_id=chunk.get("kb_id", kb_id),
             version_no=chunk.get("version_no"),
@@ -184,17 +192,27 @@ class MemoryRetriever(BaseRetriever):
         if filters:
             kb_chunks = [c for c in kb_chunks if match_filters(c.get("metadata", {}) or c.get("meta", {}), filters)]
 
+        top_k = request.top_k or 5
         mode = resolve_mode(getattr(request, "mode", None), kb_mode)
-        recall = max(request.top_k, 20)
+        recall = max(top_k, 20)
         if mode == MODE_VECTOR:
             results = self._vector_rank(kb_chunks, request)
+            results = apply_score_threshold(results, getattr(request, "score_threshold", 0.0))
         elif mode == MODE_FULLTEXT:
             results = self._fulltext_rank(kb_chunks, request)
+            results = apply_score_threshold(results, getattr(request, "score_threshold", 0.0))
         else:  # hybrid：库内 RRF 融合稠密+稀疏两路
-            dense = self._vector_rank(kb_chunks, request)[:recall]
-            sparse = self._fulltext_rank(kb_chunks, request)[:recall]
-            results = reciprocal_rank_fusion([dense, sparse])
-        return results[:request.top_k]
+            threshold = getattr(request, "score_threshold", 0.0)
+            dense = apply_score_threshold(self._vector_rank(kb_chunks, request), threshold)[:recall]
+            sparse = apply_score_threshold(self._fulltext_rank(kb_chunks, request), threshold)[:recall]
+            results = reciprocal_rank_fusion(
+                [dense, sparse],
+                weights=[
+                    getattr(request, "vector_weight", 0.6),
+                    getattr(request, "keyword_weight", 0.4),
+                ],
+            )
+        return results[:top_k]
 
     async def delete_by_version(self, kb_id: str, version_id: str):
         if kb_id in self._chunks:

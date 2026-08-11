@@ -11,6 +11,7 @@ class ChunkingStrategy(str, Enum):
     HEADING = "heading"
     TABLE = "table"
     QA_PAIR = "qa_pair"
+    PARENT_CHILD = "parent_child"
 
 
 class KnowledgeBase(BaseModel):
@@ -20,10 +21,17 @@ class KnowledgeBase(BaseModel):
     chunking_strategy: ChunkingStrategy = ChunkingStrategy.AUTO
     chunk_size: int = 512
     chunk_overlap: int = 50
+    embedding_model: str = "BAAI/bge-small-zh-v1.5"
+    rerank_model: str = "BAAI/bge-reranker-base"
     document_count: int = 0
     kb_form: str = "standard"            # faq | standard | temporal | multimodal
     retrieval_mode: str = "hybrid"       # vector | fulltext | hybrid
+    top_k: int = 5
     priority_weight: float = 0.7
+    vector_weight: float = 0.6
+    keyword_weight: float = 0.4
+    score_threshold: float = 0.0      # raw score floor before hybrid RRF
+    shortcut_threshold: float = 0.0
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
 
@@ -59,7 +67,7 @@ class Chunk(BaseModel):
     metadata: dict = Field(default_factory=dict)
     context_header: str = ""
     keywords: list[str] = Field(default_factory=list)
-    token_count: int = 0
+    token_count: int = 0              # rough estimate only; not strict tokenizer output
 
 
 class SearchResult(BaseModel):
@@ -85,8 +93,12 @@ class SearchRequest(BaseModel):
     """单库检索（保留，供调试/召回测试）。"""
     query: str = Field(..., min_length=1, max_length=500)
     kb_id: str
-    top_k: int = 5
+    top_k: int | None = None
     mode: str | None = None              # None=用库级 retrieval_mode；可覆盖
+    embedding_model: str | None = None
+    vector_weight: float = 0.6
+    keyword_weight: float = 0.4
+    score_threshold: float = 0.0      # raw score floor before hybrid RRF
     filters: list[MetaFilter] = Field(default_factory=list)
 
 
@@ -94,7 +106,7 @@ class RouteSearchRequest(BaseModel):
     """聚合检索（Agent 主用）：跨多库路由 + 融合。"""
     query: str = Field(..., min_length=1, max_length=500)
     scope: list[str] | None = None       # 限定参与的 kb_form/kb_id；None=全部公共库
-    top_k: int = 5
+    top_k: int | None = None
     filters: list[MetaFilter] = Field(default_factory=list)
 
 

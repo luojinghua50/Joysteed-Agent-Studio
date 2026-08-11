@@ -1,5 +1,6 @@
 import re
 from src.models import Chunk, ChunkingStrategy
+from src.extraction import PageSegment
 
 
 STRATEGY_MAPPING = {
@@ -20,6 +21,87 @@ class SmartSplitter:
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
 
+    @staticmethod
+    def _estimate_token_count(text: str) -> int:
+        """Rough token estimate for storage/display only; char count keeps it dependency-free."""
+        return len(text)
+
+    def split_segments(
+        self,
+        segments: list[PageSegment],
+        file_type: str = "txt",
+        strategy: ChunkingStrategy = ChunkingStrategy.AUTO,
+    ) -> list[Chunk]:
+        """Position-aware split: each PageSegment is split independently so that
+        every chunk carries page/line metadata for source traceability.
+
+        For non-positional strategies (table, qa_pair, parent_child) the segments
+        are concatenated and split as a whole — page metadata is set to the first
+        segment's page number since these strategies rely on document-level structure.
+        """
+        if strategy == ChunkingStrategy.AUTO:
+            strategy = STRATEGY_MAPPING.get(file_type, ChunkingStrategy.RECURSIVE)
+
+        # Strategies that need full-document context: concatenate first
+        if strategy in (ChunkingStrategy.TABLE, ChunkingStrategy.QA_PAIR,
+                        ChunkingStrategy.PARENT_CHILD, ChunkingStrategy.HEADING):
+            full_text = "\n\n".join(s["text"] for s in segments)
+            chunks = self.split(full_text, file_type, strategy)
+            # Attach page from first segment as approximate source
+            first_page = segments[0]["page"] if segments else 1
+            for ch in chunks:
+                ch.metadata.setdefault("page", first_page)
+            return chunks
+
+        # Recursive / fixed / semantic: split per page to preserve line positions
+        all_chunks: list[Chunk] = []
+        for seg in segments:
+            page_chunks = self._split_page_segment(seg, strategy)
+            all_chunks.extend(page_chunks)
+
+        # Re-index chunk ids sequentially across all pages
+        for i, ch in enumerate(all_chunks):
+            ch.id = f"chunk-{i:04d}"
+            ch.index = i
+        return all_chunks
+
+    def _split_page_segment(self, seg: PageSegment, strategy: ChunkingStrategy) -> list[Chunk]:
+        """Split one page segment and attach page + line_start + line_end to each chunk."""
+        lines = seg["lines"]
+        page = seg["page"]
+
+        if not lines:
+            return []
+
+        chunks: list[Chunk] = []
+
+        if strategy == ChunkingStrategy.FIXED:
+            raw_chunks = self._split_fixed(seg["text"])
+        else:
+            raw_chunks = self._split_recursive(seg["text"])
+
+        # Map each chunk back to its line range within the page
+        # by scanning lines sequentially and matching chunk text
+        line_cursor = 0
+        for ch in raw_chunks:
+            chunk_lines = [l for l in ch.text.splitlines() if l.strip()]
+            start_line = line_cursor + 1  # 1-based
+            # Advance cursor by the number of lines consumed
+            consumed = len(chunk_lines)
+            end_line = line_cursor + consumed
+            line_cursor = end_line
+
+            ch.metadata = {
+                **ch.metadata,
+                "page": page,
+                "line_start": start_line,
+                "line_end": min(end_line, len(lines)),
+                "total_lines": len(lines),
+            }
+            chunks.append(ch)
+
+        return chunks
+
     def split(
         self, text: str, file_type: str = "txt", strategy: ChunkingStrategy = ChunkingStrategy.AUTO
     ) -> list[Chunk]:
@@ -34,6 +116,12 @@ class SmartSplitter:
             return self._split_fixed(text)
         elif strategy == ChunkingStrategy.QA_PAIR:
             return self._split_qa(text)
+        elif strategy == ChunkingStrategy.PARENT_CHILD:
+            return self._split_parent_child(text)
+        elif strategy == ChunkingStrategy.TABLE:
+            return self._split_table(text)
+        elif strategy == ChunkingStrategy.SEMANTIC:
+            return self._split_recursive(text)
         else:
             return self._split_recursive(text)
 
@@ -88,7 +176,10 @@ class SmartSplitter:
         for part in parts:
             candidate = current + sep + part if current else part
             if len(candidate) > self.chunk_size and current:
-                chunks.append(self._make_chunk(current.strip(), len(chunks)))
+                if len(current) > self.chunk_size and remaining_seps:
+                    chunks.extend(self._recursive_split(current, remaining_seps))
+                else:
+                    chunks.append(self._make_chunk(current.strip(), len(chunks)))
                 current = part
             else:
                 current = candidate
@@ -126,13 +217,83 @@ class SmartSplitter:
             return self._split_recursive(text)
         return chunks
 
-    def _make_chunk(self, text: str, index: int, header: str = "") -> Chunk:
+    def _split_table(self, text: str) -> list[Chunk]:
+        """Split CSV/TSV into one chunk per data row, each prefixed with the header.
+
+        Header line = first non-empty row. Every data row becomes its own chunk so
+        retrieval returns exactly one record rather than a mixed multi-row blob.
+        When a single row already exceeds chunk_size (e.g. very wide tables), it is
+        still emitted as one chunk — splitting mid-row would destroy the record.
+        """
+        rows = [r for r in text.splitlines() if r.strip()]
+        if not rows:
+            return []
+
+        header = rows[0]
+        data_rows = rows[1:]
+
+        if not data_rows:
+            # Header-only file — return as a single chunk
+            return [self._make_chunk(header, 0)]
+
+        chunks = []
+        for row in data_rows:
+            chunk_text = f"{header}\n{row}"
+            chunks.append(self._make_chunk(chunk_text, len(chunks)))
+        return chunks
+
+    def _split_parent_child(self, text: str) -> list[Chunk]:
+        """Index child chunks while preserving parent section text for recall context."""
+        sections = self._heading_sections(text)
+        if not sections:
+            sections = [("", text)]
+
+        chunks: list[Chunk] = []
+        for parent_index, (header, body) in enumerate(sections):
+            parent_text = f"{header}\n\n{body}".strip() if header else body.strip()
+            if not parent_text:
+                continue
+            child_source = body.strip() or parent_text
+            children = self._split_recursive(child_source)
+            for child_index, child in enumerate(children):
+                chunks.append(self._make_chunk(
+                    child.text,
+                    len(chunks),
+                    header,
+                    metadata={
+                        "parent_id": f"parent-{parent_index:04d}",
+                        "parent_index": parent_index,
+                        "child_index": child_index,
+                        "parent_text": parent_text,
+                    },
+                ))
+        return chunks
+
+    def _heading_sections(self, text: str) -> list[tuple[str, str]]:
+        sections = re.split(r'(?:^|\n)(#{1,3}\s+.+)', text)
+        out: list[tuple[str, str]] = []
+        current_header = ""
+        current_text = ""
+        for section in sections:
+            if re.match(r'^#{1,3}\s+', section):
+                if current_text.strip():
+                    out.append((current_header, current_text.strip()))
+                current_header = section.strip()
+                current_text = ""
+            else:
+                current_text += section
+        if current_text.strip():
+            out.append((current_header, current_text.strip()))
+        return out
+
+    def _make_chunk(self, text: str, index: int, header: str = "", metadata: dict | None = None) -> Chunk:
         return Chunk(
             id=f"chunk-{index:04d}",
             doc_id="",
             kb_id="",
             text=text,
             index=index,
+            metadata=metadata or {},
             context_header=header,
-            token_count=len(text),
+            token_count=self._estimate_token_count(text),
         )

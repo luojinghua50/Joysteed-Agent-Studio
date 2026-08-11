@@ -10,11 +10,11 @@ import { UploadPanel } from './UploadPanel';
 import { SearchTester } from './SearchTester';
 import { VersionDrawer } from './VersionDrawer';
 import { MetadataFields } from './MetadataFields';
-import { ThresholdSetting } from './ThresholdSetting';
 
 interface KbDetailProps {
   kb: KnowledgeBase;
   onBack: () => void;
+  onEdit: (kb: KnowledgeBase) => void;
 }
 
 function fmtSize(bytes?: number): string {
@@ -24,9 +24,7 @@ function fmtSize(bytes?: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
-export function KbDetail({ kb: initialKb, onBack }: KbDetailProps) {
-  // 本地持有 kb，使阈值更新后头部徽章与高级设置即时同步。
-  const [kb, setKb] = useState<KnowledgeBase>(initialKb);
+export function KbDetail({ kb, onBack, onEdit }: KbDetailProps) {
   const [docs, setDocs] = useState<DocumentInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -65,7 +63,7 @@ export function KbDetail({ kb: initialKb, onBack }: KbDetailProps) {
         <button style={s.btnGhost} onClick={onBack}>
           ← 返回列表
         </button>
-        <div>
+        <div style={{ flex: '1 1 420px' }}>
           <span style={{ fontSize: 17, fontWeight: 600 }}>{kb.name}</span>
           <span style={{ ...s.pill, background: kbFormMeta(kb.kb_form).color, marginLeft: 10 }}>
             {kbFormMeta(kb.kb_form).label}
@@ -74,13 +72,14 @@ export function KbDetail({ kb: initialKb, onBack }: KbDetailProps) {
             {kb.description || '无描述'} · 策略 {kb.chunking_strategy} · {kb.id}
           </span>
         </div>
+        <button style={s.btnGhost} onClick={() => onEdit(kb)}>
+          编辑配置
+        </button>
       </div>
 
       <UploadPanel kbId={kb.id} onUploaded={refresh} />
 
-      <MetadataFields kbId={kb.id} />
-
-      {kb.kb_form === 'faq' && <ThresholdSetting kb={kb} onUpdated={setKb} />}
+      <MetadataFields kb={kb} />
 
       <div style={s.card}>
         <div style={{ ...s.row, justifyContent: 'space-between' }}>
@@ -145,7 +144,7 @@ export function KbDetail({ kb: initialKb, onBack }: KbDetailProps) {
         )}
       </div>
 
-      <SearchTester kbId={kb.id} />
+      <SearchTester kbId={kb.id} defaultTopK={kb.top_k ?? 5} />
 
       {versionDoc && (
         <VersionDrawer
