@@ -100,6 +100,7 @@ export async function createSession(customerId: string): Promise<string> {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ content: 'init', customer_id: customerId }),
   });
+  if (!response.ok) throw new Error(`创建会话失败 (${response.status})`);
   const data = await response.json();
   return data.session_id;
 }

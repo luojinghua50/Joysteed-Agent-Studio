@@ -102,16 +102,25 @@ export function logout(): void {
   clearTokens();
 }
 
-/** Try to refresh the access token. Returns true on success. */
+/** Try to refresh the access token. Returns true on success.
+ *  On failure (expired/invalid refresh token, or none stored) clears both
+ *  tokens so `isLoggedIn()` reports false and the app falls back to the
+ *  login/guest screen instead of looping on 401s indefinitely. */
 async function tryRefresh(): Promise<boolean> {
   const refresh_token = getRefreshToken();
-  if (!refresh_token) return false;
+  if (!refresh_token) {
+    clearTokens();
+    return false;
+  }
   const resp = await fetch(`${API_BASE}/auth/refresh`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ refresh_token }),
   });
-  if (!resp.ok) return false;
+  if (!resp.ok) {
+    clearTokens();
+    return false;
+  }
   storeTokens(await resp.json());
   return true;
 }

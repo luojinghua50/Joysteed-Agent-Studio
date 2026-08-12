@@ -27,22 +27,35 @@ function App() {
     if (!customerId) return;
     let cancelled = false;
     (async () => {
-      const list = await refreshSessions();
-      if (cancelled) return;
-      const stored = localStorage.getItem('agent_session_id');
-      const storedIsMine = stored && list.some((s) => s.session_id === stored);
-      let id: string;
-      if (storedIsMine) {
-        id = stored!;
-      } else if (list.length > 0) {
-        id = list[0].session_id; // newest first, from the backend ordering
-      } else {
-        id = await createSession(customerId);
+      try {
+        const list = await refreshSessions();
         if (cancelled) return;
-        await refreshSessions();
+        const stored = localStorage.getItem('agent_session_id');
+        const storedIsMine = stored && list.some((s) => s.session_id === stored);
+        let id: string;
+        if (storedIsMine) {
+          id = stored!;
+        } else if (list.length > 0) {
+          id = list[0].session_id; // newest first, from the backend ordering
+        } else {
+          id = await createSession(customerId);
+          if (cancelled) return;
+          await refreshSessions();
+        }
+        localStorage.setItem('agent_session_id', id);
+        setSessionId(id);
+      } catch (err) {
+        if (cancelled) return;
+        // A hard auth failure (expired/invalid tokens with no working refresh)
+        // clears tokens in authFetch/tryRefresh -- bounce back to the login
+        // screen instead of leaving the app stuck on a blank page.
+        if (!isLoggedIn()) {
+          localStorage.removeItem('agent_session_id');
+          setCustomerId(null);
+        } else {
+          console.error('Failed to initialize session', err);
+        }
       }
-      localStorage.setItem('agent_session_id', id);
-      setSessionId(id);
     })();
     return () => { cancelled = true; };
   }, [customerId, refreshSessions]);
