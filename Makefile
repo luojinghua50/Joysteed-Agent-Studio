@@ -12,7 +12,7 @@ down: ## Stop all services
 build: ## Build all Docker images
 	docker compose build
 
-test: test-core test-rag ## Run all tests
+test: test-core test-rag test-tools ## Run all tests
 
 test-core: ## Run agent-core tests
 	cd agent-core && source .venv/bin/activate && python -m pytest tests/ -v
@@ -20,20 +20,27 @@ test-core: ## Run agent-core tests
 test-rag: ## Run agent-rag tests
 	cd agent-rag && source .venv/bin/activate && python -m pytest tests/ -v
 
+test-tools: ## Run agent-tools tests
+	cd agent-tools && source .venv/bin/activate && python -m pytest tests/ -v
+
 test-web: ## Run agent-web tests
 	cd agent-web && npm test
 
 lint: ## Lint all Python projects
 	cd agent-core && source .venv/bin/activate && ruff check src/ tests/
 	cd agent-rag && source .venv/bin/activate && ruff check src/ tests/
+	cd agent-tools && source .venv/bin/activate && ruff check .
 
-install: install-core install-rag install-web ## Install all dependencies
+install: install-core install-rag install-tools install-web ## Install all dependencies
 
 install-core: ## Install agent-core dependencies
 	cd agent-core && uv venv --python 3.12 .venv && source .venv/bin/activate && uv pip install -e ".[dev]"
 
 install-rag: ## Install agent-rag dependencies
 	cd agent-rag && uv venv --python 3.12 .venv && source .venv/bin/activate && uv pip install -e ".[dev]"
+
+install-tools: ## Install agent-tools dependencies
+	cd agent-tools && uv venv --python 3.12 .venv && source .venv/bin/activate && uv pip install -e ".[dev]"
 
 install-web: ## Install agent-web dependencies
 	cd agent-web && npm install
