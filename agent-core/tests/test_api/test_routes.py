@@ -1,6 +1,8 @@
+import asyncio
+
 import pytest
 from httpx import AsyncClient, ASGITransport
-from src.api.routes import create_app
+from src.api.routes import create_app, _run_graph_with_heartbeat
 from src.config import Settings
 from src.database import init_db
 from src.security.auth import create_access_token
@@ -128,6 +130,25 @@ async def test_chat_classifies_complaint_intent(client, auth):
     }, headers=auth("C001"))
     body = response.text
     assert "抱歉" in body
+
+
+@pytest.mark.asyncio
+async def test_run_graph_with_heartbeat_emits_status():
+    async def slow_result():
+        await asyncio.sleep(0.03)
+        return {"ok": True}
+
+    events = []
+    async for kind, value in _run_graph_with_heartbeat(
+        slow_result(), phase="graph", interval=0.005
+    ):
+        events.append((kind, value))
+
+    assert events[0][0] == "event"
+    assert '"type": "status"' in events[0][1]
+    assert '"status": "started"' in events[0][1]
+    assert any('"status": "heartbeat"' in value for kind, value in events if kind == "event")
+    assert events[-1] == ("result", {"ok": True})
 
 
 @pytest.mark.asyncio

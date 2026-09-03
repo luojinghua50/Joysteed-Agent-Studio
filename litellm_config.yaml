@@ -40,14 +40,19 @@ model_list:
     model_info:
       description: "跨厂商兜底 — 全部 Claude 部署不可用时切换"
 
+  - model_name: "qwen3:14b"
+    litellm_params:
+      model: ollama_chat/qwen3:14b
+      api_base: http://host.docker.internal:11434
+
 litellm_settings:
   set_verbose: true
   log_responses: true
   json_logs: true
-  # 把 LiteLLM 内部的调用（含 retry/fallback）上报 Langfuse。
-  # failure_callback 是关键：claude 认证失败这条 ERROR generation 才会被记录，
-  # 从而在 Langfuse 里看到「claude 失败 + gpt-5.5 成功」两条相邻记录 = fallback 证据。
-  success_callback: ["langfuse"]
+  # 只报失败：成功调用已由 agent-core 侧 LangChain callback 上报（带业务上下文
+  # session_id/agent/trace），避免重复计入 Langfuse 汇总花费/token。失败必须由
+  # LiteLLM 自己报——agent-core 侧看不到内部 retry/fallback 细节，只有这样才能
+  # 看到「claude 失败 + gpt-5.5 成功」两条相邻记录 = fallback 证据。
   failure_callback: ["langfuse"]
 
 router_settings:
