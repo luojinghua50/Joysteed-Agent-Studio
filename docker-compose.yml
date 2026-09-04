@@ -5,10 +5,14 @@ services:
     ports:
       - "8000:8000"
     environment:
+      - LITELLM_BASE_URL=http://litellm:4000
+      - LITELLM_API_KEY=sk-litellm-key
+      - MODEL_FAST=${MODEL_FAST:-claude-haiku-4-5}
+      - MODEL_MAIN=${MODEL_MAIN:-claude-sonnet-4-6}
+      - MODEL_COMPLEX=${MODEL_COMPLEX:-claude-opus-4-6}
       - PYTHONUNBUFFERED=1
       - REDIS_URL=redis://redis:6379/0
       - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/agent_core
-      - LITELLM_BASE_URL=http://litellm:4000
       - KNOWLEDGE_MCP_URL=http://knowledge-mcp:8001/mcp
       - ORDER_MCP_URL=http://order-mcp:8002/mcp
       - TICKET_MCP_URL=http://ticket-mcp:8003/mcp
@@ -217,6 +221,10 @@ services:
     volumes:
       - ./litellm_config.yaml:/app/config.yaml
     command: --config /app/config.yaml
+    # host.docker.internal 在 Linux 上（本项目容器基础镜像/CI 常见环境）默认不会
+    # 自动注入 /etc/hosts，必须显式声明才能从容器内访问宿主机上的 Ollama。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}

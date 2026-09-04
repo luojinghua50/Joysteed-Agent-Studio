@@ -22,13 +22,23 @@ from src.agents.synthesizer import synthesize_node
 from src.config import Settings
 
 
+def _extra_body_for_model(model_name: str) -> dict:
+    """Provider-specific OpenAI-compatible request extras."""
+    normalized = model_name.lower()
+    if normalized.startswith("qwen3:") or "qwen3:" in normalized:
+        return {"think": False}
+    return {}
+
+
 def create_llm(settings: Settings, model_name: str | None = None) -> ChatOpenAI:
     """Create an LLM instance configured to use LiteLLM proxy."""
+    selected_model = model_name or settings.model_main
     return ChatOpenAI(
-        model=model_name or settings.model_main,
+        model=selected_model,
         base_url=settings.litellm_base_url,
         api_key=settings.litellm_api_key,
         temperature=0.1,
+        extra_body=_extra_body_for_model(selected_model),
     )
 
 

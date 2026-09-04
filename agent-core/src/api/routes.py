@@ -1,3 +1,4 @@
+import asyncio
 import json
 import uuid
 from datetime import datetime
@@ -341,7 +342,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 if app.state.langfuse_handler:
                     config["callbacks"] = [app.state.langfuse_handler]
 
-                graph_result = await app.state.graph.ainvoke(initial_state, config=config)
+                graph_result = None
+                async for kind, value in _run_graph_with_heartbeat(
+                    app.state.graph.ainvoke(initial_state, config=config),
+                    phase="graph",
+                ):
+                    if kind == "event":
+                        yield value
+                    else:
+                        graph_result = value
+
+                if graph_result is None:
+                    raise RuntimeError("Graph execution finished without a result")
 
                 # 审批闸中断：图在 approval 节点暂停，不产出最终回复。发 approval
                 # 事件让前端（坐席台）确认，随后调 /approve 真实 resume 本 thread。
@@ -399,9 +411,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "reason": request.reason,
                     "decisions": request.decisions,
                 }
-                graph_result = await app.state.graph.ainvoke(
-                    Command(resume=resume_value), config=config
-                )
+                graph_result = None
+                async for kind, value in _run_graph_with_heartbeat(
+                    app.state.graph.ainvoke(Command(resume=resume_value), config=config),
+                    phase="approval_resume",
+                ):
+                    if kind == "event":
+                        yield value
+                    else:
+                        graph_result = value
+
+                if graph_result is None:
+                    raise RuntimeError("Graph execution finished without a result")
+
                 async for chunk in _emit_result(graph_result, session_id, db_factory):
                     yield chunk
             except Exception as e:
@@ -547,6 +569,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 def _generate_fallback_response(message: str) -> str:
     """Fallback response when LLM is unavailable."""
     return "抱歉，系统暂时繁忙，请稍后再试。如需紧急帮助，请拨打客服热线。"
+
+
+def _sse_event(payload: dict) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+async def _run_graph_with_heartbeat(coro, *, phase: str, interval: float = 10.0):
+    """Run a long graph call while keeping the SSE connection alive."""
+    task = asyncio.create_task(coro)
+    elapsed = 0.0
+    try:
+        yield "event", _sse_event({"type": "status", "phase": phase, "status": "started"})
+        while True:
+            try:
+                result = await asyncio.wait_for(asyncio.shield(task), timeout=interval)
+                yield "result", result
+                return
+            except asyncio.TimeoutError:
+                elapsed += interval
+                yield "event", _sse_event({
+                    "type": "status",
+                    "phase": phase,
+                    "status": "heartbeat",
+                    "elapsed_seconds": int(elapsed),
+                })
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 async def _emit_result(graph_result: dict, session_id: str, db_factory):

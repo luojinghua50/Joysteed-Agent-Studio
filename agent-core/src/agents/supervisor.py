@@ -84,6 +84,28 @@ class IntentPlan(BaseModel):
 # 匹配 ```json ... ``` 或 ``` ... ``` 代码围栏，捕获其中的内容
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 
+# 部分本地模型（如 qwen3 系列）默认开启 thinking，会在正式回答前吐出
+# <think>...</think> 推理块。该块常常复述 system prompt 里的规则原文
+# （逐字包含所有意图标签），混进后续解析会污染 JSON 提取和纯文本分类。
+_THINK_RE = re.compile(r"<think\b[^>]*>.*?(?:</think>|$)", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_think(content: str | list | None) -> str:
+    """剥离 <think>...</think> 推理块，只保留模型的正式输出部分。
+
+    response.content 类型是 str | list[str | dict]：多模态消息下 langchain
+    会拆成内容块列表，这里先拼接成纯文本再剥推理块。若本地模型输出了未闭合
+    的 <think>，则从该标记开始剥到末尾，避免推理文本污染分类/JSON 解析。
+    """
+    if not content:
+        return ""
+    if isinstance(content, list):
+        content = "".join(
+            part if isinstance(part, str) else str(part.get("text", ""))
+            for part in content
+        )
+    return _THINK_RE.sub("", content).strip()
+
 
 def _extract_json(text: str) -> str:
     """从 LLM 文本响应中提取 JSON 串。
@@ -104,11 +126,22 @@ def _extract_json(text: str) -> str:
     return text.strip()
 
 
-def _parse_intent(content: str) -> str:
+# 有序列表而非 set：子串匹配存在多个标签同时命中的可能（如推理文本里复述了
+# 多个规则），此时命中顺序必须由业务优先级决定，不能受 set 迭代顺序（随进程
+# hash seed 变化）影响——否则同一次回复在不同进程里可能解析出不同意图。
+_VALID_INTENTS_ORDERED = ("human", "complaint", "tech_support", "order", "faq")
+
+
+def _parse_intent(content: str | list) -> str:
     """Parse the intent from LLM response."""
-    content = (content or "").strip().lower()
-    valid_intents = {"faq", "order", "complaint", "tech_support", "human"}
-    for intent in valid_intents:
+    content = _strip_think(content).lower()
+    # 只看最后一行：system prompt 要求"只输出意图标签"，模型即使额外输出了
+    # 说明文字，真正的结论也几乎总在末尾；避免匹配到正文里复述的规则原文。
+    last_line = content.splitlines()[-1] if content else ""
+    for intent in _VALID_INTENTS_ORDERED:
+        if intent in last_line:
+            return intent
+    for intent in _VALID_INTENTS_ORDERED:
         if intent in content:
             return intent
     return "human"
@@ -171,7 +204,7 @@ async def _decompose(llm: BaseChatModel, context_messages: list, memory_context:
     if memory_context:
         prompt += f"\n\n## 用户背景信息\n{memory_context}"
     response = await llm.ainvoke([SystemMessage(content=prompt), *context_messages])
-    return IntentPlan.model_validate_json(_extract_json(response.content))
+    return IntentPlan.model_validate_json(_extract_json(_strip_think(response.content)))
 
 
 async def _classify_single(llm: BaseChatModel, context_messages: list, memory_context: str) -> dict:
